@@ -11051,6 +11051,7 @@ static const AVOption mov_options[] = {
     { "max_stts_delta", "treat offsets above this value as invalid", OFFSET(max_stts_delta), AV_OPT_TYPE_INT, {.i64 = UINT_MAX-48000*10 }, 0, UINT_MAX, .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "interleaved_read", "Interleave packets from multiple tracks at demuxer level", OFFSET(interleaved_read), AV_OPT_TYPE_BOOL, {.i64 = 1 }, 0, 1, .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "mov_ignore_hier_sidx", "Ignore hierarchical SIDX (reference_type=1): warn and keep timing, but do not advance byte offsets.", OFFSET(ignore_hier_sidx), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
+    { "ignore_hier_sidx", "Alias for mov_ignore_hier_sidx.", OFFSET(ignore_hier_sidx), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
 
     { NULL },
 };
