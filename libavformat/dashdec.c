@@ -159,7 +159,7 @@ typedef struct DASHContext {
     int is_init_section_common_video;
     int is_init_section_common_audio;
     int is_init_section_common_subtitle;
-	int allow_hier_sidx; // if set, forward MOV option to ignore hierarchical SIDX
+	int ignore_hier_sidx; // if set, forward MOV option to ignore hierarchical SIDX
 
 } DASHContext;
 
@@ -1917,12 +1917,10 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation 
     if (c->cenc_decryption_key)
         av_dict_set(&in_fmt_opts, "decryption_key", c->cenc_decryption_key, 0);
 
-    /* Forward MOV demuxer option so hierarchical SIDX (reference_type=1)
-     * is tolerated when opening init segments via DASH. This is a no-op
-     * for non-MOV demuxers; the option will simply be ignored there. */
-    /* Forward MOV demuxer option only when explicitly enabled via dash_allow_hier_sidx. */
-	if (c->allow_hier_sidx)
-		av_dict_set(&in_fmt_opts, "mov_ignore_hier_sidx", "1", 0);
+    /* Forward hierarchical SIDX tolerance to the nested demuxer when opening
+     * DASH init segments. Non-MOV demuxers simply ignore the option. */
+    if (c->ignore_hier_sidx)
+        av_dict_set(&in_fmt_opts, "ignore_hier_sidx", "1", 0);
 
     // provide additional information from mpd if available
     ret = avformat_open_input(&pls->ctx, "", in_fmt, &in_fmt_opts); //pls->init_section->url
@@ -2365,10 +2363,10 @@ static const AVOption dash_options[] = {
         {.str = "aac,m4a,m4s,m4v,mov,mp4,webm,ts"},
         INT_MIN, INT_MAX, FLAGS},
     { "cenc_decryption_key", "Media decryption key (hex)", OFFSET(cenc_decryption_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
-	{ "dash_allow_hier_sidx",
-		"Forward MOV option mov_ignore_hier_sidx to tolerate hierarchical SIDX (reference_type=1). Default off.",
-		OFFSET(allow_hier_sidx),
-		AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
+    { "ignore_hier_sidx",
+        "Forward hierarchical SIDX tolerance to nested demuxers (MOV). Default off.",
+        OFFSET(ignore_hier_sidx),
+        AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
     {NULL}
 };
 

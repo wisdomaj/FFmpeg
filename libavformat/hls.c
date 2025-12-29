@@ -241,6 +241,7 @@ typedef struct HLSContext {
     // HLS query parameter inheritance
     int inherit_query_params;
     char *root_query;
+    int ignore_hier_sidx; // if set, forward MOV option to ignore hierarchical SIDX
 } HLSContext;
 
 static void free_segment_dynarray(struct segment **segments, int n_segments)
@@ -2466,6 +2467,11 @@ static int hls_read_header(AVFormatContext *s)
 
         av_dict_copy(&options, c->seg_format_opts, 0);
 
+        /* Forward hierarchical SIDX tolerance to the nested demuxer when opening
+         * HLS segments. Non-MOV demuxers simply ignore the option. */
+        if (c->ignore_hier_sidx)
+            av_dict_set(&options, "ignore_hier_sidx", "1", 0);
+
         ret = avformat_open_input(&pls->ctx, pls->segments[0]->url, in_fmt, &options);
         av_dict_free(&options);
         if (ret < 0)
@@ -2937,6 +2943,9 @@ static const AVOption hls_options[] = {
      OFFSET(skip_png_bytes), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
     {"hls_inherit_query_params", "Inherit query parameters from root URL to relative URIs",
      OFFSET(inherit_query_params), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
+    {"ignore_hier_sidx",
+     "Forward hierarchical SIDX tolerance to nested demuxers (MOV). Default off.",
+     OFFSET(ignore_hier_sidx), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS},
     {NULL}
 };
 
