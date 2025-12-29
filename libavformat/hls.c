@@ -174,6 +174,9 @@ struct playlist {
     int n_init_sections;
     struct segment **init_sections;
     int is_subtitle; /* Indicates if it's a subtitle playlist */
+
+    // HLS query parameter inheritance
+    char *base_query;
 };
 
 /*
@@ -234,6 +237,10 @@ typedef struct HLSContext {
     int skip_png_bytes;
     AVIOContext *playlist_pb;
     HLSCryptoContext  crypto_ctx;
+
+    // HLS query parameter inheritance
+    int inherit_query_params;
+    char *root_query;
 } HLSContext;
 
 static void free_segment_dynarray(struct segment **segments, int n_segments)
@@ -265,6 +272,20 @@ static void free_init_section_list(struct playlist *pls)
     pls->n_init_sections = 0;
 }
 
+// Helper function to append query parameters to URL if inheritance is enabled
+static void append_query_if_needed(HLSContext *c, char *url_buf, size_t buf_size, const char *base_query)
+{
+    if (!c->inherit_query_params || !base_query)
+        return;
+
+    // Check if URL already has a query
+    if (strchr(url_buf, '?'))
+        return;
+
+    // Append the base query
+    av_strlcat(url_buf, base_query, buf_size);
+}
+
 static void free_playlist_list(HLSContext *c)
 {
     int i;
@@ -288,6 +309,7 @@ static void free_playlist_list(HLSContext *c)
             pls->ctx->pb = NULL;
             avformat_close_input(&pls->ctx);
         }
+        av_freep(&pls->base_query);
         av_free(pls);
     }
     av_freep(&c->playlists);
@@ -336,6 +358,23 @@ static struct playlist *new_playlist(HLSContext *c, const char *url,
 
     pls->is_id3_timestamped = -1;
     pls->id3_mpegts_timestamp = AV_NOPTS_VALUE;
+
+    // Inherit query parameters if enabled
+    if (c->inherit_query_params) {
+        const char *query_start = strchr(pls->url, '?');
+        if (query_start) {
+            // This playlist has its own query, use it
+            pls->base_query = av_strdup(query_start);
+        } else if (c->root_query) {
+            // Inherit from root
+            pls->base_query = av_strdup(c->root_query);
+        }
+        if (pls->base_query == NULL && (query_start || c->root_query)) {
+            av_packet_free(&pls->pkt);
+            av_free(pls);
+            return NULL;
+        }
+    }
 
     dynarray_add(&c->playlists, &c->n_playlists, pls);
     return pls;
@@ -441,6 +480,8 @@ static struct segment *new_init_section(struct playlist *pls,
             av_free(sec);
             return NULL;
         }
+        HLSContext *c = pls->parent->priv_data;
+        append_query_if_needed(c, tmp_str, sizeof(tmp_str), pls->base_query);
     }
     sec->url = av_strdup(ptr);
     if (!sec->url) {
@@ -1030,6 +1071,7 @@ static int parse_playlist(HLSContext *c, const char *url,
                     av_free(seg);
                     goto fail;
                 }
+                append_query_if_needed(c, tmp_str, sizeof(tmp_str), pls->base_query);
                 seg->url = av_strdup(tmp_str);
                 if (!seg->url) {
                     av_free(seg->key);
@@ -2172,6 +2214,7 @@ static int hls_close(AVFormatContext *s)
 
     av_dict_free(&c->avio_opts);
     ff_format_io_close(c->ctx, &c->playlist_pb);
+    av_freep(&c->root_query);
 
     return 0;
 }
@@ -2188,6 +2231,16 @@ static int hls_read_header(AVFormatContext *s)
     c->first_packet = 1;
     c->first_timestamp = AV_NOPTS_VALUE;
     c->cur_timestamp = AV_NOPTS_VALUE;
+
+    // Parse root URL and extract query for inheritance
+    if (c->inherit_query_params) {
+        const char *query_start = strchr(s->url, '?');
+        if (query_start) {
+            c->root_query = av_strdup(query_start);
+            if (!c->root_query)
+                return AVERROR(ENOMEM);
+        }
+    }
 
     if ((ret = ffio_copy_url_options(s->pb, &c->avio_opts)) < 0)
         return ret;
@@ -2882,6 +2935,8 @@ static const AVOption hls_options[] = {
      OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, FLAGS},
     {"skip_png_bytes", "Skip PNG wrapper at start of each segment",
      OFFSET(skip_png_bytes), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
+    {"hls_inherit_query_params", "Inherit query parameters from root URL to relative URIs",
+     OFFSET(inherit_query_params), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
     {NULL}
 };
 
