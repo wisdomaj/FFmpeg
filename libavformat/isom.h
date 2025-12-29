@@ -380,6 +380,7 @@ typedef struct MOVContext {
     int nb_thmb_item;
     int64_t idat_offset;
     int interleaved_read;
+    int ignore_hier_sidx; ///< allow continuing on SIDX ref_type=1 (hierarchical)
 } MOVContext;
 
 int ff_mp4_read_descr_len(AVIOContext *pb);

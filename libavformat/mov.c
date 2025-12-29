@@ -6108,16 +6108,19 @@ static int mov_read_sidx(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     for (i = 0; i < item_count; i++) {
         int index;
         MOVFragmentStreamInfo * frag_stream_info;
+        int ref_type1 = 0;
         uint32_t size = avio_rb32(pb);
         uint32_t duration = avio_rb32(pb);
         if (size & 0x80000000) {
-            // Hierarchical SIDX (reference_type = 1). Not fully supported in FFmpeg.
-            // As a pragmatic workaround, ignore the flag and continue by masking the bit,
-            // so timing is still collected and DASH can proceed when media ranges are
-            // provided by SegmentTemplate rather than this SIDX.
+            // reference_type == 1 (hierarchical SIDX)
+            ref_type1 = 1;
+            size &= 0x7FFFFFFF; // keep numeric part of size for completeness
+            if (!c->ignore_hier_sidx) {
+                avpriv_request_sample(c->fc, "sidx reference_type 1");
+                return AVERROR_PATCHWELCOME;
+            }
             av_log(c->fc, AV_LOG_WARNING,
-                   "sidx reference_type=1 encountered; continuing by masking flag\n");
-            size &= 0x7FFFFFFF;
+                   "sidx reference_type=1 encountered; ignoring byte-range contribution and continuing\n");
         }
         avio_rb32(pb); // sap_flags
         timestamp = av_rescale_q(pts, timescale, st->time_base);
@@ -6127,11 +6130,15 @@ static int mov_read_sidx(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         if (frag_stream_info)
             frag_stream_info->sidx_pts = timestamp;
 
-        if (av_sat_add64(offset, size) != offset + (uint64_t)size ||
-            av_sat_add64(pts, duration) != pts + (uint64_t)duration
-        )
+        if (av_sat_add64(pts, duration) != pts + (uint64_t)duration)
             return AVERROR_INVALIDDATA;
-        offset += size;
+
+        // Only advance byte offset when entry points to media (ref_type==0)
+        if (!ref_type1) {
+            if (av_sat_add64(offset, size) != offset + (uint64_t)size)
+                return AVERROR_INVALIDDATA;
+            offset += size;
+        }
         pts += duration;
     }
 
@@ -11496,6 +11503,7 @@ static const AVOption mov_options[] = {
         {.i64 = 0}, 0, 1, FLAGS },
     { "max_stts_delta", "treat offsets above this value as invalid", OFFSET(max_stts_delta), AV_OPT_TYPE_INT, {.i64 = UINT_MAX-48000*10 }, 0, UINT_MAX, .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "interleaved_read", "Interleave packets from multiple tracks at demuxer level", OFFSET(interleaved_read), AV_OPT_TYPE_BOOL, {.i64 = 1 }, 0, 1, .flags = AV_OPT_FLAG_DECODING_PARAM },
+    { "mov_ignore_hier_sidx", "Ignore hierarchical SIDX (reference_type=1): warn and keep timing, but do not advance byte offsets.", OFFSET(ignore_hier_sidx), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
 
     { NULL },
 };
