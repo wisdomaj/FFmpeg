@@ -6111,8 +6111,13 @@ static int mov_read_sidx(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         uint32_t size = avio_rb32(pb);
         uint32_t duration = avio_rb32(pb);
         if (size & 0x80000000) {
-            avpriv_request_sample(c->fc, "sidx reference_type 1");
-            return AVERROR_PATCHWELCOME;
+            // Hierarchical SIDX (reference_type = 1). Not fully supported in FFmpeg.
+            // As a pragmatic workaround, ignore the flag and continue by masking the bit,
+            // so timing is still collected and DASH can proceed when media ranges are
+            // provided by SegmentTemplate rather than this SIDX.
+            av_log(c->fc, AV_LOG_WARNING,
+                   "sidx reference_type=1 encountered; continuing by masking flag\n");
+            size &= 0x7FFFFFFF;
         }
         avio_rb32(pb); // sap_flags
         timestamp = av_rescale_q(pts, timescale, st->time_base);
