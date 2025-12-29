@@ -231,6 +231,7 @@ typedef struct HLSContext {
     int http_multiple;
     int http_seekable;
     int seg_max_retry;
+    int skip_png_bytes;
     AVIOContext *playlist_pb;
     HLSCryptoContext  crypto_ctx;
 } HLSContext;
@@ -1119,6 +1120,44 @@ static struct segment *next_segment(struct playlist *pls)
     return pls->segments[n];
 }
 
+/* Strip PNG wrapper from the beginning of the buffer if present.
+ * Returns the number of bytes to skip, or 0 if no PNG found. */
+static int strip_png_wrapper(uint8_t *buf, int buf_size)
+{
+    /* PNG 8-byte signature */
+    static const uint8_t png_magic[8] = {
+        0x89, 0x50, 0x4E, 0x47,
+        0x0D, 0x0A, 0x1A, 0x0A
+    };
+
+    /* IEND chunk header: 00 00 00 0 | 'I' 'E' 'N' 'D' */
+    static const uint8_t iend_marker[8] = {
+        0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4E, 0x44
+    };
+
+    if (buf_size < 8 || memcmp(buf, png_magic, 8) != 0)
+        return 0; /* Not PNG */
+
+    /* Search for IEND chunk header starting after signature */
+    for (int i = 8; i + 8 <= buf_size; i++) {
+        if (!memcmp(buf + i, iend_marker, 8)) {
+            int end_of_png = i + 8 + 4; /* header(8) + CRC(4) */
+
+            /* Sanity: we must have the CRC inside this buffer */
+            if (end_of_png <= buf_size)
+                return end_of_png;
+
+            /* IEND header found but CRC not in this buffer:
+               treat as incomplete → don't strip. */
+            return 0;
+        }
+    }
+
+    /* No IEND inside this buffer */
+    return 0;
+}
+
 static int read_from_url(struct playlist *pls, struct segment *seg,
                          uint8_t *buf, int buf_size)
 {
@@ -1721,6 +1760,23 @@ restart:
     seg = current_segment(v);
     ret = read_from_url(v, seg, buf, buf_size);
     if (ret > 0) {
+        if (c->skip_png_bytes) {
+            av_log(v->parent, AV_LOG_DEBUG, "PNG check: cur_seg_offset=%"PRId64", ret=%d, condition=%d\n",
+                   v->cur_seg_offset, ret, v->cur_seg_offset == ret);
+        }
+        if (c->skip_png_bytes && v->cur_seg_offset == ret) {
+            /* Strip PNG wrapper if present at the start of the segment */
+            int skip = strip_png_wrapper(buf, ret);
+            if (skip > 0 && skip < ret) {
+                av_log(v->parent, AV_LOG_DEBUG, "Stripped %d PNG bytes from HLS segment %s\n", skip, seg->url);
+                memmove(buf, buf + skip, ret - skip);
+                ret -= skip;
+                /* NOTE: do NOT change v->cur_seg_offset here - it tracks remote bytes read */
+            } else {
+                av_log(v->parent, AV_LOG_DEBUG, "No PNG found in segment %s (skip=%d, ret=%d)\n", seg->url, skip, ret);
+            }
+        }
+
         if (just_opened && v->is_id3_timestamped != 0) {
             /* Intercept ID3 tags here, elementary audio streams are required
              * to convey timestamps using them in the beginning of each segment. */
@@ -2824,6 +2880,8 @@ static const AVOption hls_options[] = {
         OFFSET(seg_format_opts), AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, FLAGS},
     {"seg_max_retry", "Maximum number of times to reload a segment on error.",
      OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, FLAGS},
+    {"skip_png_bytes", "Skip PNG wrapper at start of each segment",
+     OFFSET(skip_png_bytes), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
     {NULL}
 };
 
