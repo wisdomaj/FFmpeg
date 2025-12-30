@@ -2924,7 +2924,7 @@ static const AVOption hls_options[] = {
         },
         INT_MIN, INT_MAX, FLAGS},
     {"extension_picky", "Be picky with all extensions matching",
-        OFFSET(extension_picky), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS},
+        OFFSET(extension_picky), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
     {"max_reload", "Maximum number of times a insufficient list is attempted to be reloaded",
         OFFSET(max_reload), AV_OPT_TYPE_INT, {.i64 = 100}, 0, INT_MAX, FLAGS},
     {"m3u8_hold_counters", "The maximum number of times to load m3u8 when it refreshes without new segments",
