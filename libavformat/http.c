@@ -464,22 +464,53 @@ static int mvd_read_data(URLContext *h, uint8_t *buf, int size)
 
 static int mvd_build_headers(MVDCurlHTTPContext *s)
 {
-    if (!s->headers) return 0;
+    if (!s->headers || !*s->headers)
+        return 0;
 
+    // FFmpeg CLI passes -headers as a single string where lines are typically separated by '\n'.
+    // Some callers use CRLF. Accept both.
     const char *p = s->headers;
     while (*p) {
-        const char *e = strstr(p, "\r\n");
-        size_t len = e ? (size_t)(e - p) : strlen(p);
-        if (len) {
-            char *line = av_strndup(p, len);
-            if (!line) return AVERROR(ENOMEM);
-            if (line[0] != '\0')
-                s->hdr_list = curl_slist_append(s->hdr_list, line);
+        // Find end-of-line by LF; tolerate CRLF.
+        const char *lf = strchr(p, '\n');
+        size_t len = lf ? (size_t)(lf - p) : strlen(p);
+
+        // Trim a trailing '\r' (CRLF case)
+        while (len > 0 && p[len - 1] == '\r')
+            len--;
+
+        // Trim leading/trailing spaces/tabs
+        size_t start = 0;
+        while (start < len && (p[start] == ' ' || p[start] == '\t'))
+            start++;
+        while (len > start && (p[len - 1] == ' ' || p[len - 1] == '\t'))
+            len--;
+
+        if (len > start) {
+            char *line = av_strndup(p + start, len - start);
+            if (!line)
+                return AVERROR(ENOMEM);
+
+            // libcurl rejects header lines containing CR/LF. Be strict.
+            if (!strchr(line, '\n') && !strchr(line, '\r')) {
+                struct curl_slist *new_list = curl_slist_append(s->hdr_list, line);
+                if (!new_list) {
+                    av_log(s->h, AV_LOG_WARNING, "Failed to append header line to curl list (ignored): %s\n", line);
+                } else {
+                    s->hdr_list = new_list;
+                }
+            } else {
+                av_log(s->h, AV_LOG_WARNING, "Skipping invalid header line containing CR/LF\n");
+            }
+
             av_free(line);
         }
-        if (!e) break;
-        p = e + 2;
+
+        if (!lf)
+            break;
+        p = lf + 1;
     }
+
     return 0;
 }
 
@@ -904,9 +935,11 @@ static int mvd_prepare_easy(MVDCurlHTTPContext *s)
         curl_easy_setopt(s->easy, CURLOPT_LOW_SPEED_LIMIT, 0L);
     }
 
-    if (s->user_agent && *s->user_agent)
+    // Respect explicit headers provided via -headers first.
+    // If the caller provided "User-Agent:" or "Referer:" there, do not override with defaults.
+    if (!mvd_has_header(s->headers, "User-Agent") && s->user_agent && *s->user_agent)
         curl_easy_setopt(s->easy, CURLOPT_USERAGENT, s->user_agent);
-    if (s->referer && *s->referer)
+    if (!mvd_has_header(s->headers, "Referer") && s->referer && *s->referer)
         curl_easy_setopt(s->easy, CURLOPT_REFERER, s->referer);
 
     if (s->hdr_list) {
