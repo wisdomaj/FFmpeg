@@ -214,6 +214,12 @@ typedef struct MVDCurlHTTPContext {
 
 #define MVD_OFFSET(x) offsetof(MVDCurlHTTPContext, x)
 
+// Forward declarations (C99 forbids implicit function declarations)
+static int mvd_open(URLContext *h, const char *uri, int flags, AVDictionary **options);
+static int mvd_read(URLContext *h, uint8_t *buf, int size);
+static int64_t mvd_seek(URLContext *h, int64_t off, int whence);
+static int mvd_close(URLContext *h);
+
 static const AVOption mvd_curl_http_options[] = {
     { "headers",    "set custom HTTP headers",            MVD_OFFSET(headers),    AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D | E },
     { "user_agent", "override User-Agent header",         MVD_OFFSET(user_agent), AV_OPT_TYPE_STRING, { .str = DEFAULT_USER_AGENT }, 0, 0, D },
