@@ -469,11 +469,16 @@ static int mvd_build_headers(MVDCurlHTTPContext *s)
 
     const char *p = s->headers;
     while (*p) {
-        const char *e = strstr(p, "\r\n");
-        size_t len = e ? (size_t)(e - p) : strlen(p);
+        const char *lf = strchr(p, '\n');
+        size_t len = lf ? (size_t)(lf - p) : strlen(p);
+        while (len && p[len - 1] == '\r')
+            len--;
+
         if (len) {
             char *line = av_strndup(p, len);
-            if (!line) return AVERROR(ENOMEM);
+            if (!line)
+                return AVERROR(ENOMEM);
+
             if (line[0] != '\0') {
                 struct curl_slist *new_list = curl_slist_append(s->hdr_list, line);
                 if (!new_list) {
@@ -482,18 +487,22 @@ static int mvd_build_headers(MVDCurlHTTPContext *s)
                     s->hdr_list = new_list;
                 }
             }
+
             av_free(line);
         }
-        if (!e) break;
-        p = e + 2;
+
+        if (!lf)
+            break;
+        p = lf + 1;
     }
+
     return 0;
 }
 
 static const char *mvd_find_header_value(const char *headers, const char *key)
 {
-    // Very small helper for debug output. Returns pointer into `headers` (not NUL-terminated).
-    // Caller should copy/format if needed.
+    // Debug helper: returns pointer into `headers` (not NUL-terminated).
+    // Works with both LF and CRLF separated header strings.
     if (!headers || !key)
         return NULL;
 
@@ -501,19 +510,22 @@ static const char *mvd_find_header_value(const char *headers, const char *key)
     const size_t klen = strlen(key);
 
     while (*p) {
-        const char *e = strstr(p, "\r\n");
-        size_t len = e ? (size_t)(e - p) : strlen(p);
+        // Find end of line (LF). Line may end with CRLF.
+        const char *lf = strchr(p, '\n');
+        size_t len = lf ? (size_t)(lf - p) : strlen(p);
+        while (len && p[len - 1] == '\r')
+            len--;
 
         if (len > klen + 1 && !av_strncasecmp(p, key, klen) && p[klen] == ':') {
             const char *v = p + klen + 1;
-            while ((v - p) < (ptrdiff_t)len && (*v == ' ' || *v == '\t'))
+            while ((size_t)(v - p) < len && (*v == ' ' || *v == '\t'))
                 v++;
             return v; // not terminated
         }
 
-        if (!e)
+        if (!lf)
             break;
-        p = e + 2;
+        p = lf + 1;
     }
 
     return NULL;
@@ -524,7 +536,6 @@ static void mvd_log_request_headers(URLContext *h, MVDCurlHTTPContext *s, const 
     if (!h || !s)
         return;
 
-    // Keep it close to FFmpeg's http.c style: one compact block per request.
     av_log(h, AV_LOG_DEBUG, "HTTP %s request to %s\n",
            (h->flags & AVIO_FLAG_WRITE) ? "WRITE" : "READ",
            s->url ? s->url : "");
@@ -534,17 +545,20 @@ static void mvd_log_request_headers(URLContext *h, MVDCurlHTTPContext *s, const 
     const char *ref = mvd_find_header_value(s->headers, "Referer");
 
     if (ua) {
-        // Print until end of line
-        const char *ua_end = strstr(ua, "\r\n");
+        const char *ua_end = strchr(ua, '\n');
         size_t ua_len = ua_end ? (size_t)(ua_end - ua) : strlen(ua);
+        while (ua_len && ua[ua_len - 1] == '\r')
+            ua_len--;
         av_log(h, AV_LOG_DEBUG, "  User-Agent: %.*s\n", (int)ua_len, ua);
     } else if (s->user_agent && *s->user_agent) {
         av_log(h, AV_LOG_DEBUG, "  User-Agent: %s\n", s->user_agent);
     }
 
     if (ref) {
-        const char *ref_end = strstr(ref, "\r\n");
+        const char *ref_end = strchr(ref, '\n');
         size_t ref_len = ref_end ? (size_t)(ref_end - ref) : strlen(ref);
+        while (ref_len && ref[ref_len - 1] == '\r')
+            ref_len--;
         av_log(h, AV_LOG_DEBUG, "  Referer: %.*s\n", (int)ref_len, ref);
     } else if (s->referer && *s->referer) {
         av_log(h, AV_LOG_DEBUG, "  Referer: %s\n", s->referer);
@@ -553,22 +567,32 @@ static void mvd_log_request_headers(URLContext *h, MVDCurlHTTPContext *s, const 
     if (range && *range)
         av_log(h, AV_LOG_DEBUG, "  Range: %s\n", range);
 
-    // Show custom headers (excluding cookies for readability/safety).
+    // Print the actual outgoing header list (one line per log call).
     if (s->hdr_list) {
+        int cookie_printed = 0;
         struct curl_slist *it = s->hdr_list;
         for (; it; it = it->next) {
             const char *line = it->data;
-            if (!line)
+            if (!line || !*line)
                 continue;
-            // Hide cookies to avoid huge/noisy logs.
-            if (!av_strncasecmp(line, "Cookie:", 7))
-                av_log(h, AV_LOG_DEBUG, "  Cookie: [redacted]\n");
-            else
-                av_log(h, AV_LOG_DEBUG, "  %s\n", line);
+
+            if (!av_strncasecmp(line, "Cookie:", 7)) {
+                if (!cookie_printed) {
+                    av_log(h, AV_LOG_DEBUG, "  Cookie: [redacted]\n");
+                    cookie_printed = 1;
+                }
+                continue;
+            }
+
+            // Ensure we never pass embedded newlines into av_log.
+            if (strchr(line, '\n') || strchr(line, '\r')) {
+                av_log(h, AV_LOG_DEBUG, "  [header contains newline; skipped]\n");
+                continue;
+            }
+
+            av_log(h, AV_LOG_DEBUG, "  %s\n", line);
         }
     }
-
-    av_log(h, AV_LOG_DEBUG, "\n");
 }
 
 static int mvd_has_header(const char *headers, const char *needle)
