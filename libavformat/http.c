@@ -235,6 +235,7 @@ typedef struct MVDCurlHTTPContext {
     char *http_version;
     char *location_header;
     char *content_encoding;
+    char *content_type;
     char *set_cookie_headers;
     char *cookie_jar;
     int accept_ranges;
@@ -543,9 +544,6 @@ static void mvd_feed_cookie_list(CURL *easy, URLContext *h, const char *list, in
         }
         av_log(h, AV_LOG_DEBUG, "CURLOPT_COOKIELIST command: \"%s\"\n", cmd);
         CURLcode rc = curl_easy_setopt(easy, CURLOPT_COOKIELIST, cmd);
-        if (rc != CURLE_OK) {
-            console_warn("curl_easy_setopt(CURLOPT_COOKIELIST, \"%s\") failed: %s", cmd, curl_easy_strerror(rc));
-        }
         av_free(command);
     }
 
@@ -575,6 +573,7 @@ static void mvd_reset_header_state(MVDCurlHTTPContext *s)
 {
     av_freep(&s->http_version);
     av_freep(&s->content_encoding);
+    av_freep(&s->content_type);
     av_freep(&s->location_header);
     av_freep(&s->set_cookie_headers);
     av_freep(&s->icy_metadata_headers);
@@ -669,6 +668,9 @@ static void mvd_handle_header_line(MVDCurlHTTPContext *s, const char *name, cons
     } else if (!av_strcasecmp(name, "content-encoding")) {
         av_freep(&s->content_encoding);
         s->content_encoding = av_strdup(value);
+    } else if (!av_strcasecmp(name, "content-type")) {
+        av_freep(&s->content_type);
+        s->content_type = av_strdup(value);
     } else if (!av_strcasecmp(name, "set-cookie")) {
         mvd_append_line(&s->set_cookie_headers, value);
         char *cookie_line = av_asprintf("Set-Cookie: %s", value);
@@ -1034,8 +1036,36 @@ static int mvd_read_once(URLContext *h, uint8_t *buf, int size)
                 CURLcode cc = msg->data.result;
                 s->last_curl_code = cc;
                 curl_easy_getinfo(s->easy, CURLINFO_RESPONSE_CODE, &s->http_code);
+                {
+                    char *eff = NULL;
+                    curl_easy_getinfo(s->easy, CURLINFO_EFFECTIVE_URL, &eff);
+                    av_log(h, AV_LOG_DEBUG,
+                        "curl done: curl=%d(%s) http=%ld eff_url=%s fill=%zu\n",
+                        (int)cc, curl_easy_strerror(cc), s->http_code,
+                        eff ? eff : "", s->fill);
+                }
                 if (cc == CURLE_OK) {
                     if (s->http_code >= 400) {
+                        if (s->fill > 0) {
+                            size_t dump = FFMIN((size_t)64, s->fill);
+                            char preview[65];
+                            size_t i;
+                            for (i = 0; i < dump; i++) {
+                                preview[i] = (char)s->ring[(s->rpos + i) % s->cap];
+                                if (preview[i] == '\r' || preview[i] == '\n')
+                                    preview[i] = ' ';
+                            }
+                            preview[dump] = '\0';
+                            av_log(h, AV_LOG_WARNING,
+                                "HTTP %ld returned body bytes (first %zu): '%s' (Content-Type: %s)\n",
+                                s->http_code, dump, preview, s->content_type ? s->content_type : "");
+                        } else {
+                            av_log(h, AV_LOG_WARNING,
+                                "HTTP %ld with no buffered body (Content-Type: %s)\n",
+                                s->http_code, s->content_type ? s->content_type : "");
+                        }
+                        // Don’t let demuxers parse error pages
+                        s->rpos = s->wpos = s->fill = 0;
                         switch (s->http_code) {
                         case 400: s->err = AVERROR_HTTP_BAD_REQUEST; break;
                         case 401: s->err = AVERROR_HTTP_UNAUTHORIZED; break;
@@ -1185,6 +1215,7 @@ static int mvd_close(URLContext *h)
     av_freep(&s->http_version);
     av_freep(&s->location_header);
     av_freep(&s->content_encoding);
+    av_freep(&s->content_type);
     av_freep(&s->set_cookie_headers);
     av_freep(&s->cookie_jar);
     av_freep(&s->icy_metadata_headers);
