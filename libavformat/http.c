@@ -1283,7 +1283,6 @@ static int mvd_close(URLContext *h)
     av_freep(&s->icy_metadata_headers);
     av_freep(&s->icy_metadata_packet);
     av_dict_free(&s->metadata);
-    av_opt_free(s);
     return 0;
 }
 
