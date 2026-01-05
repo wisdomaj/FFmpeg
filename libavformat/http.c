@@ -503,7 +503,7 @@ static int mvd_append_line(char **dst, const char *line)
     return 0;
 }
 
-static void mvd_feed_cookie_list(CURL *easy, const char *list, int add_prefix)
+static void mvd_feed_cookie_list(CURL *easy, URLContext *h, const char *list, int add_prefix)
 {
     if (!easy || !list)
         return;
@@ -512,9 +512,23 @@ static void mvd_feed_cookie_list(CURL *easy, const char *list, int add_prefix)
     if (!copy)
         return;
 
+    av_log(h, AV_LOG_DEBUG, "Feeding cookie list (%s) tokens\n", add_prefix ? "user" : "jar");
     char *token = NULL;
     char *saveptr = NULL;
     for (token = av_strtok(copy, "\n", &saveptr); token; token = av_strtok(NULL, "\n", &saveptr)) {
+        // Trim whitespace and \r from both ends
+        while (*token && (*token == ' ' || *token == '\t' || *token == '\r'))
+            token++;
+        char *end = token + strlen(token) - 1;
+        while (end >= token && (*end == ' ' || *end == '\t' || *end == '\r'))
+            *end-- = '\0';
+        if (!*token) {
+            av_log(h, AV_LOG_DEBUG, "Skipped empty cookie token after trimming\n");
+            continue; // Skip empty after trimming
+        }
+
+        av_log(h, AV_LOG_DEBUG, "Prepared cookie token: \"%s\"\n", token);
+
         char *command = NULL;
         const char *cmd = token;
         if (add_prefix) {
@@ -527,7 +541,11 @@ static void mvd_feed_cookie_list(CURL *easy, const char *list, int add_prefix)
                     cmd = command;
             }
         }
-        curl_easy_setopt(easy, CURLOPT_COOKIELIST, cmd);
+        av_log(h, AV_LOG_DEBUG, "CURLOPT_COOKIELIST command: \"%s\"\n", cmd);
+        CURLcode rc = curl_easy_setopt(easy, CURLOPT_COOKIELIST, cmd);
+        if (rc != CURLE_OK) {
+            console_warn("curl_easy_setopt(CURLOPT_COOKIELIST, \"%s\") failed: %s", cmd, curl_easy_strerror(rc));
+        }
         av_free(command);
     }
 
@@ -536,7 +554,7 @@ static void mvd_feed_cookie_list(CURL *easy, const char *list, int add_prefix)
 
 static void mvd_feed_cookie_jar(MVDCurlHTTPContext *s)
 {
-    mvd_feed_cookie_list(s->easy, s->cookie_jar, 0);
+    mvd_feed_cookie_list(s->easy, s->h, s->cookie_jar, 0);
 }
 
 static int mvd_store_icy_header(MVDCurlHTTPContext *s, const char *tag, const char *value)
@@ -826,7 +844,7 @@ static int mvd_prepare_easy(MVDCurlHTTPContext *s)
     curl_easy_setopt(s->easy, CURLOPT_COOKIEFILE, "");
     mvd_feed_cookie_jar(s);
     if (s->cookies && *s->cookies)
-        mvd_feed_cookie_list(s->easy, s->cookies, 1);
+        mvd_feed_cookie_list(s->easy, s->h, s->cookies, 1);
 
     if (s->timeout_us > 0)
         curl_easy_setopt(s->easy, CURLOPT_CONNECTTIMEOUT_MS, (long)FFMAX(1, s->timeout_us / 1000));
