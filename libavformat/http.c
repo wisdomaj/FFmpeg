@@ -167,7 +167,7 @@ static int parse_http_date(const char *date_str, struct tm *buf);
 #include <inttypes.h>
 #include <errno.h>
 #include "libavutil/error.h"
-#include "libavutil/atomic.h"
+#include <stdatomic.h>
 
 #define MVD_CURL_RING_CAP (4 * 1024 * 1024)  // 4 MiB bounded buffer
 
