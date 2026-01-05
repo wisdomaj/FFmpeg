@@ -159,7 +159,30 @@ typedef struct HTTPContext {
 #define E AV_OPT_FLAG_ENCODING_PARAM
 #define DEFAULT_USER_AGENT "Lavf/" AV_STRINGIFY(LIBAVFORMAT_VERSION)
 
-static int parse_http_date(const char *date_str, struct tm *buf);
+static int parse_http_date(const char *date_str, struct tm *buf)
+{
+    char date_buf[MAX_DATE_LEN];
+    int i, j, date_buf_len = MAX_DATE_LEN-1;
+    char *date;
+
+    // strip off any punctuation or whitespace
+    for (i = 0, j = 0; date_str[i] != '\0' && j < date_buf_len; i++) {
+        if ((date_str[i] >= '0' && date_str[i] <= '9') ||
+            (date_str[i] >= 'A' && date_str[i] <= 'Z') ||
+            (date_str[i] >= 'a' && date_str[i] <= 'z')) {
+            date_buf[j] = date_str[i];
+            j++;
+        }
+    }
+    date_buf[j] = '\0';
+    date = date_buf;
+
+    // move the string beyond the day of week
+    while ((*date < '0' || *date > '9') && *date != '\0')
+        date++;
+
+    return av_small_strptime(date, "%d%b%Y%H%M%S", buf) ? 0 : AVERROR(EINVAL);
+}
 
 #ifdef MVD_USE_LIBCURL
 
@@ -1079,7 +1102,7 @@ static int mvd_read(URLContext *h, uint8_t *buf, int size)
         if (s->respect_retry_after && s->retry_after > 0)
             delay = FFMAX(delay, s->retry_after);
 
-        av_log(h, AV_LOG_WARNING, "Will reconnect at %"PRIu64" in %u second(s), error=%s.\n",
+        av_log(h, AV_LOG_WARNING, "Will reconnect at %"PRId64" in %u second(s), error=%s.\n",
                target, delay, av_err2str(ret));
 
         int sleep_ret = ff_network_sleep_interruptible(delay * 1000000U,
@@ -2043,31 +2066,6 @@ static int parse_icy(HTTPContext *s, const char *tag, const char *p)
     av_strlcatf(s->icy_metadata_headers, len, "%s: %s\n", tag, p);
 
     return 0;
-}
-
-static int parse_http_date(const char *date_str, struct tm *buf)
-{
-    char date_buf[MAX_DATE_LEN];
-    int i, j, date_buf_len = MAX_DATE_LEN-1;
-    char *date;
-
-    // strip off any punctuation or whitespace
-    for (i = 0, j = 0; date_str[i] != '\0' && j < date_buf_len; i++) {
-        if ((date_str[i] >= '0' && date_str[i] <= '9') ||
-            (date_str[i] >= 'A' && date_str[i] <= 'Z') ||
-            (date_str[i] >= 'a' && date_str[i] <= 'z')) {
-            date_buf[j] = date_str[i];
-            j++;
-        }
-    }
-    date_buf[j] = '\0';
-    date = date_buf;
-
-    // move the string beyond the day of week
-    while ((*date < '0' || *date > '9') && *date != '\0')
-        date++;
-
-    return av_small_strptime(date, "%d%b%Y%H%M%S", buf) ? 0 : AVERROR(EINVAL);
 }
 
 static int parse_set_cookie(const char *set_cookie, AVDictionary **dict)
