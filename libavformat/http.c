@@ -490,47 +490,85 @@ static int mvd_build_headers(MVDCurlHTTPContext *s)
     return 0;
 }
 
-static void mvd_log_request_headers(URLContext *h, MVDCurlHTTPContext *s, const char *range)
+static const char *mvd_find_header_value(const char *headers, const char *key)
 {
-    // Mirror FFmpeg's debug style: dump what we are about to send.
-    if (!h)
-        return;
+    // Very small helper for debug output. Returns pointer into `headers` (not NUL-terminated).
+    // Caller should copy/format if needed.
+    if (!headers || !key)
+        return NULL;
 
-    AVBPrint bp;
-    av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
+    const char *p = headers;
+    const size_t klen = strlen(key);
 
-    av_bprintf(&bp, "\n--- mvd curl request ---\n");
-    av_bprintf(&bp, "URL: %s\n", s->url ? s->url : "");
+    while (*p) {
+        const char *e = strstr(p, "\r\n");
+        size_t len = e ? (size_t)(e - p) : strlen(p);
 
-    // Note: libcurl will generate Host/Accept/Connection/etc. We log what we explicitly set.
-    if (s->user_agent && *s->user_agent)
-        av_bprintf(&bp, "User-Agent: %s\n", s->user_agent);
-    if (s->referer && *s->referer)
-        av_bprintf(&bp, "Referer: %s\n", s->referer);
+        if (len > klen + 1 && !av_strncasecmp(p, key, klen) && p[klen] == ':') {
+            const char *v = p + klen + 1;
+            while ((v - p) < (ptrdiff_t)len && (*v == ' ' || *v == '\t'))
+                v++;
+            return v; // not terminated
+        }
 
-    if (range && *range)
-        av_bprintf(&bp, "Range: %s\n", range);
-
-    if (s->headers && *s->headers) {
-        av_bprintf(&bp, "Custom headers (from -headers):\n");
-        // s->headers is CRLF-separated; print as-is but ensure it ends with \n for readability.
-        av_bprintf(&bp, "%s\n", s->headers);
+        if (!e)
+            break;
+        p = e + 2;
     }
 
-    // Also dump the actual slist we pass to CURLOPT_HTTPHEADER (includes injected ICY).
+    return NULL;
+}
+
+static void mvd_log_request_headers(URLContext *h, MVDCurlHTTPContext *s, const char *range)
+{
+    if (!h || !s)
+        return;
+
+    // Keep it close to FFmpeg's http.c style: one compact block per request.
+    av_log(h, AV_LOG_DEBUG, "HTTP %s request to %s\n",
+           (h->flags & AVIO_FLAG_WRITE) ? "WRITE" : "READ",
+           s->url ? s->url : "");
+
+    // Prefer explicit -headers values for display.
+    const char *ua = mvd_find_header_value(s->headers, "User-Agent");
+    const char *ref = mvd_find_header_value(s->headers, "Referer");
+
+    if (ua) {
+        // Print until end of line
+        const char *ua_end = strstr(ua, "\r\n");
+        size_t ua_len = ua_end ? (size_t)(ua_end - ua) : strlen(ua);
+        av_log(h, AV_LOG_DEBUG, "  User-Agent: %.*s\n", (int)ua_len, ua);
+    } else if (s->user_agent && *s->user_agent) {
+        av_log(h, AV_LOG_DEBUG, "  User-Agent: %s\n", s->user_agent);
+    }
+
+    if (ref) {
+        const char *ref_end = strstr(ref, "\r\n");
+        size_t ref_len = ref_end ? (size_t)(ref_end - ref) : strlen(ref);
+        av_log(h, AV_LOG_DEBUG, "  Referer: %.*s\n", (int)ref_len, ref);
+    } else if (s->referer && *s->referer) {
+        av_log(h, AV_LOG_DEBUG, "  Referer: %s\n", s->referer);
+    }
+
+    if (range && *range)
+        av_log(h, AV_LOG_DEBUG, "  Range: %s\n", range);
+
+    // Show custom headers (excluding cookies for readability/safety).
     if (s->hdr_list) {
         struct curl_slist *it = s->hdr_list;
-        av_bprintf(&bp, "libcurl header list:\n");
         for (; it; it = it->next) {
-            if (it->data)
-                av_bprintf(&bp, "%s\n", it->data);
+            const char *line = it->data;
+            if (!line)
+                continue;
+            // Hide cookies to avoid huge/noisy logs.
+            if (!av_strncasecmp(line, "Cookie:", 7))
+                av_log(h, AV_LOG_DEBUG, "  Cookie: [redacted]\n");
+            else
+                av_log(h, AV_LOG_DEBUG, "  %s\n", line);
         }
     }
 
-    av_bprintf(&bp, "--- end mvd curl request ---\n");
-
-    av_log(h, AV_LOG_DEBUG, "%s", bp.str);
-    av_bprint_finalize(&bp, NULL);
+    av_log(h, AV_LOG_DEBUG, "\n");
 }
 
 static int mvd_has_header(const char *headers, const char *needle)
@@ -565,7 +603,7 @@ static void mvd_feed_cookie_list(CURL *easy, URLContext *h, const char *list, in
     if (!copy)
         return;
 
-    av_log(h, AV_LOG_DEBUG, "Feeding cookie list (%s) tokens\n", add_prefix ? "user" : "jar");
+    av_log(h, AV_LOG_TRACE, "Feeding cookie list (%s) tokens\n", add_prefix ? "user" : "jar");
     char *token = NULL;
     char *saveptr = NULL;
     for (token = av_strtok(copy, "\n", &saveptr); token; token = av_strtok(NULL, "\n", &saveptr)) {
@@ -576,11 +614,11 @@ static void mvd_feed_cookie_list(CURL *easy, URLContext *h, const char *list, in
         while (end >= token && (*end == ' ' || *end == '\t' || *end == '\r'))
             *end-- = '\0';
         if (!*token) {
-            av_log(h, AV_LOG_DEBUG, "Skipped empty cookie token after trimming\n");
+            av_log(h, AV_LOG_TRACE, "Skipped empty cookie token after trimming\n");
             continue; // Skip empty after trimming
         }
 
-        av_log(h, AV_LOG_DEBUG, "Prepared cookie token: \"%s\"\n", token);
+        av_log(h, AV_LOG_TRACE, "Prepared cookie token: \"%s\"\n", token);
 
         char *command = NULL;
         const char *cmd = token;
@@ -594,7 +632,7 @@ static void mvd_feed_cookie_list(CURL *easy, URLContext *h, const char *list, in
                     cmd = command;
             }
         }
-        av_log(h, AV_LOG_DEBUG, "CURLOPT_COOKIELIST command: \"%s\"\n", cmd);
+        av_log(h, AV_LOG_TRACE, "CURLOPT_COOKIELIST command: \"%s\"\n", cmd);
         CURLcode rc = curl_easy_setopt(easy, CURLOPT_COOKIELIST, cmd);
         av_free(command);
     }
@@ -1274,6 +1312,13 @@ static int mvd_close(URLContext *h)
     av_freep(&s->ring);
     av_freep(&s->url);
     av_freep(&s->final_url);
+    av_freep(&s->headers);
+    av_freep(&s->user_agent);
+    av_freep(&s->referer);
+    av_freep(&s->cookies);
+    av_freep(&s->http_proxy);
+    av_freep(&s->no_proxy);
+    av_freep(&s->reconnect_on_http_error);
     av_freep(&s->http_version);
     av_freep(&s->location_header);
     av_freep(&s->content_encoding);
