@@ -69,6 +69,7 @@ typedef enum {
     FINISH
 }HandshakeState;
 
+#ifndef MVD_USE_LIBCURL
 typedef struct HTTPContext {
     const AVClass *class;
     URLContext *hd;
@@ -149,10 +150,509 @@ typedef struct HTTPContext {
 } HTTPContext;
 
 #define OFFSET(x) offsetof(HTTPContext, x)
+#endif // !MVD_USE_LIBCURL
+
 #define D AV_OPT_FLAG_DECODING_PARAM
 #define E AV_OPT_FLAG_ENCODING_PARAM
 #define DEFAULT_USER_AGENT "Lavf/" AV_STRINGIFY(LIBAVFORMAT_VERSION)
 
+#ifdef MVD_USE_LIBCURL
+
+#include <curl/curl.h>
+#include <inttypes.h>
+#include <errno.h>
+#include "libavutil/error.h"
+
+#define MVD_CURL_RING_CAP (4 * 1024 * 1024)  // 4 MiB bounded buffer
+
+typedef struct MVDCurlHTTPContext {
+    const AVClass *class;
+
+    char *url;
+    char *final_url;
+    char *user_agent;
+    char *referer;
+    char *headers;   // CRLF-separated header lines
+    char *cookies;   // treated as Cookie: value
+
+    int64_t off;
+    int seekable;
+
+    int timeout_us;
+    int rw_timeout_us;
+
+    // Compatibility with FFmpeg http.c options
+    int reconnect;
+    int reconnect_at_eof;
+    int reconnect_on_network_error;
+    int reconnect_streamed;
+    int reconnect_delay_max;
+    int reconnect_max_retries;
+    int reconnect_delay_total_max;
+    int respect_retry_after;
+    char *reconnect_on_http_error;
+
+    uint8_t *ring;
+    size_t cap, rpos, wpos, fill;
+
+    int eof;
+    int err;
+    int64_t content_length; // best-effort
+    long http_code;
+
+    CURL *easy;
+    CURLM *multi;
+    struct curl_slist *hdr_list;
+
+    int abort_request;
+    int64_t request_start;
+
+    int paused;
+
+    URLContext *h; // for interrupt_callback
+} MVDCurlHTTPContext;
+
+#define MVD_OFFSET(x) offsetof(MVDCurlHTTPContext, x)
+
+static const AVOption mvd_curl_http_options[] = {
+    { "headers",    "set custom HTTP headers",            MVD_OFFSET(headers),    AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D | E },
+    { "user_agent", "override User-Agent header",         MVD_OFFSET(user_agent), AV_OPT_TYPE_STRING, { .str = DEFAULT_USER_AGENT }, 0, 0, D },
+    { "referer",    "override referer header",            MVD_OFFSET(referer),    AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+    { "cookies",    "cookies to send (Cookie: value)",    MVD_OFFSET(cookies),    AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+    { "offset",     "initial byte offset",                MVD_OFFSET(off),        AV_OPT_TYPE_INT64,  { .i64 = 0 },    0, INT64_MAX, D },
+    { "seekable",   "control seekability of connection",  MVD_OFFSET(seekable),   AV_OPT_TYPE_BOOL,   { .i64 = -1 },  -1, 1, D },
+    { "timeout",    "connection timeout in microseconds", MVD_OFFSET(timeout_us), AV_OPT_TYPE_INT,    { .i64 = 0 },     0, INT_MAX, D },
+    { "rw_timeout", "read/write timeout in microseconds", MVD_OFFSET(rw_timeout_us), AV_OPT_TYPE_INT, { .i64 = 0 },  0, INT_MAX, D },
+
+    // Insert FFmpeg http.c compatible options for CLI compatibility and retry logic
+    { "reconnect", "auto reconnect after disconnect before EOF", MVD_OFFSET(reconnect), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
+    { "reconnect_at_eof", "auto reconnect at EOF", MVD_OFFSET(reconnect_at_eof), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
+    { "reconnect_on_network_error", "auto reconnect in case of network error", MVD_OFFSET(reconnect_on_network_error), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
+    { "reconnect_on_http_error", "list of http status codes/groups to reconnect on", MVD_OFFSET(reconnect_on_http_error), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+    { "reconnect_streamed", "auto reconnect streamed / non seekable streams", MVD_OFFSET(reconnect_streamed), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
+    { "reconnect_delay_max", "max reconnect delay in seconds after which to give up", MVD_OFFSET(reconnect_delay_max), AV_OPT_TYPE_INT, { .i64 = 120 }, 0, INT_MAX, D },
+    { "reconnect_max_retries", "the max number of times to retry a connection", MVD_OFFSET(reconnect_max_retries), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, D },
+    { "reconnect_delay_total_max", "max total reconnect delay in seconds after which to give up", MVD_OFFSET(reconnect_delay_total_max), AV_OPT_TYPE_INT, { .i64 = 256 }, 0, INT_MAX, D },
+    { "respect_retry_after", "respect the Retry-After header when retrying connections", MVD_OFFSET(respect_retry_after), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, D },
+
+    { NULL }
+};
+
+static const AVClass mvd_curl_http_class = {
+    .class_name = "mvd_curl_http",
+    .item_name  = av_default_item_name,
+    .option     = mvd_curl_http_options,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
+
+static int mvd_should_abort(MVDCurlHTTPContext *s)
+{
+    if (s->abort_request) return 1;
+    if (s->h && s->h->interrupt_callback.callback &&
+        s->h->interrupt_callback.callback(s->h->interrupt_callback.opaque))
+        return 1;
+    return 0;
+}
+
+static int mvd_xferinfo_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
+                          curl_off_t ultotal, curl_off_t ulnow)
+{
+    MVDCurlHTTPContext *s = (MVDCurlHTTPContext *)clientp;
+    (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+    return mvd_should_abort(s) ? 1 : 0;
+}
+
+static int mvd_build_headers(MVDCurlHTTPContext *s)
+{
+    if (!s->headers) return 0;
+
+    const char *p = s->headers;
+    while (*p) {
+        const char *e = strstr(p, "\r\n");
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len) {
+            char *line = av_strndup(p, len);
+            if (!line) return AVERROR(ENOMEM);
+            if (line[0] != '\0')
+                s->hdr_list = curl_slist_append(s->hdr_list, line);
+            av_free(line);
+        }
+        if (!e) break;
+        p = e + 2;
+    }
+    return 0;
+}
+
+static size_t mvd_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
+{
+    MVDCurlHTTPContext *s = (MVDCurlHTTPContext *)userdata;
+    size_t n = size * nmemb;
+    if (!n) return 0;
+
+    size_t space = s->cap - s->fill;
+    if (n > space) {
+        s->paused = 1;
+        return CURL_WRITEFUNC_PAUSE;
+    }
+
+    size_t first = FFMIN(n, s->cap - s->wpos);
+    memcpy(s->ring + s->wpos, ptr, first);
+    s->wpos = (s->wpos + first) % s->cap;
+    s->fill += first;
+
+    size_t rem = n - first;
+    if (rem) {
+        memcpy(s->ring + s->wpos, ptr + first, rem);
+        s->wpos = (s->wpos + rem) % s->cap;
+        s->fill += rem;
+    }
+
+    return n;
+}
+
+static int mvd_prepare_easy(MVDCurlHTTPContext *s)
+{
+    if (!s->easy) {
+        s->easy = curl_easy_init();
+        if (!s->easy) return AVERROR(ENOMEM);
+    } else {
+        curl_easy_reset(s->easy);
+    }
+
+    curl_easy_setopt(s->easy, CURLOPT_URL, s->url);
+    curl_easy_setopt(s->easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(s->easy, CURLOPT_MAXREDIRS, 8L);
+    curl_easy_setopt(s->easy, CURLOPT_WRITEFUNCTION, mvd_write_cb);
+    curl_easy_setopt(s->easy, CURLOPT_WRITEDATA, s);
+    curl_easy_setopt(s->easy, CURLOPT_ACCEPT_ENCODING, "");
+
+    if (s->timeout_us > 0)
+        curl_easy_setopt(s->easy, CURLOPT_CONNECTTIMEOUT_MS, (long)FFMAX(1, s->timeout_us / 1000));
+    if (s->rw_timeout_us > 0)
+        curl_easy_setopt(s->easy, CURLOPT_TIMEOUT_MS, (long)FFMAX(1, s->rw_timeout_us / 1000));
+
+    if (s->user_agent && *s->user_agent)
+        curl_easy_setopt(s->easy, CURLOPT_USERAGENT, s->user_agent);
+    if (s->referer && *s->referer)
+        curl_easy_setopt(s->easy, CURLOPT_REFERER, s->referer);
+    if (s->cookies && *s->cookies)
+        curl_easy_setopt(s->easy, CURLOPT_COOKIE, s->cookies);
+
+    if (s->hdr_list) {
+        curl_slist_free_all(s->hdr_list);
+        s->hdr_list = NULL;
+    }
+    {
+        int ret = mvd_build_headers(s);
+        if (ret < 0) return ret;
+        if (s->hdr_list)
+            curl_easy_setopt(s->easy, CURLOPT_HTTPHEADER, s->hdr_list);
+    }
+
+#if LIBCURL_VERSION_NUM >= 0x072000
+    curl_easy_setopt(s->easy, CURLOPT_XFERINFOFUNCTION, mvd_xferinfo_cb);
+    curl_easy_setopt(s->easy, CURLOPT_XFERINFODATA, s);
+    curl_easy_setopt(s->easy, CURLOPT_NOPROGRESS, 0L);
+#endif
+
+    if (s->request_start > 0) {
+        char range[64];
+        snprintf(range, sizeof(range), "bytes=%"PRId64"-", s->request_start);
+        curl_easy_setopt(s->easy, CURLOPT_RANGE, range);
+    }
+
+    curl_easy_setopt(s->easy, CURLOPT_TCP_KEEPALIVE, 1L);
+    return 0;
+}
+
+static int mvd_start(MVDCurlHTTPContext *s)
+{
+    s->abort_request = 0;
+    s->rpos = s->wpos = s->fill = 0;
+    s->eof = 0;
+    s->err = 0;
+    s->paused = 0;
+    s->content_length = -1;
+
+    if (s->multi) {
+        if (s->easy) curl_multi_remove_handle(s->multi, s->easy);
+        curl_multi_cleanup(s->multi);
+        s->multi = NULL;
+    }
+
+    int prep = mvd_prepare_easy(s);
+    if (prep < 0) return prep;
+
+    s->multi = curl_multi_init();
+    if (!s->multi) return AVERROR(ENOMEM);
+
+    curl_multi_add_handle(s->multi, s->easy);
+    return 0;
+}
+
+static int mvd_open(URLContext *h, const char *uri, int flags, AVDictionary **options)
+{
+    MVDCurlHTTPContext *s = h->priv_data;
+    int ret;
+    static int mvd_curl_inited = 0;
+
+    (void)flags;
+    if (!mvd_curl_inited) {
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+        mvd_curl_inited = 1;
+    }
+
+    s->class = &mvd_curl_http_class;
+    s->h = h;
+
+    if (options) {
+        ret = av_opt_set_dict(s, options);
+        if (ret < 0) goto fail;
+    }
+
+    av_freep(&s->url);
+    s->url = av_strdup(uri);
+    if (!s->url) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    s->cap = MVD_CURL_RING_CAP;
+    s->ring = av_malloc(s->cap);
+    if (!s->ring) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    h->is_streamed = (s->seekable == 1) ? 0 : 1;
+
+    s->request_start = s->off;
+    ret = mvd_start(s);
+    if (ret < 0) goto fail;
+
+    return 0;
+
+fail:
+    mvd_close(h);
+    return ret;
+}
+
+static int mvd_read(URLContext *h, uint8_t *buf, int size)
+{
+    MVDCurlHTTPContext *s = h->priv_data;
+    int out = 0;
+
+    while (out < size) {
+        if (mvd_should_abort(s)) return AVERROR_EXIT;
+
+        if (s->fill > 0) {
+            size_t take = FFMIN((size_t)(size - out), s->fill);
+            size_t first = FFMIN(take, s->cap - s->rpos);
+            memcpy(buf + out, s->ring + s->rpos, first);
+            s->rpos = (s->rpos + first) % s->cap;
+            s->fill -= first;
+            out += (int)first;
+
+            size_t rem = take - first;
+            if (rem) {
+                memcpy(buf + out, s->ring + s->rpos, rem);
+                s->rpos = (s->rpos + rem) % s->cap;
+                s->fill -= rem;
+                out += (int)rem;
+            }
+
+            if (s->paused && (s->cap - s->fill) >= 64 * 1024) {
+                s->paused = 0;
+                curl_easy_pause(s->easy, CURLPAUSE_CONT);
+            }
+            continue;
+        }
+
+        if (s->eof) {
+            if (out > 0) break;
+            return s->err ? s->err : AVERROR_EOF;
+        }
+
+        // No data in ring, pump curl
+        int running;
+        CURLMcode mc = curl_multi_perform(s->multi, &running);
+        if (mc != CURLM_OK) return AVERROR(EIO);
+
+        if (!running) {
+            int msgs;
+            CURLMsg *msg = curl_multi_info_read(s->multi, &msgs);
+            if (msg && msg->msg == CURLMSG_DONE) {
+                CURLcode cc = msg->data.result;
+                curl_easy_getinfo(s->easy, CURLINFO_RESPONSE_CODE, &s->http_code);
+                if (cc == CURLE_OK) {
+                    if (s->http_code >= 400) {
+                        switch (s->http_code) {
+                        case 400: s->err = AVERROR_HTTP_BAD_REQUEST; break;
+                        case 401: s->err = AVERROR_HTTP_UNAUTHORIZED; break;
+                        case 403: s->err = AVERROR_HTTP_FORBIDDEN; break;
+                        case 404: s->err = AVERROR_HTTP_NOT_FOUND; break;
+                        case 429: s->err = AVERROR_HTTP_TOO_MANY_REQUESTS; break;
+                        default:
+                            if (s->http_code >= 500) s->err = AVERROR_HTTP_SERVER_ERROR;
+                            else s->err = AVERROR_HTTP_OTHER_4XX;
+                            break;
+                        }
+                    } else {
+                        curl_off_t clen = -1;
+                        if (curl_easy_getinfo(s->easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &clen) == CURLE_OK && clen >= 0)
+                            s->content_length = (int64_t)clen + s->request_start;
+                        
+                        char *eff_url = NULL;
+                        if (curl_easy_getinfo(s->easy, CURLINFO_EFFECTIVE_URL, &eff_url) == CURLE_OK && eff_url) {
+                            av_freep(&s->final_url);
+                            s->final_url = av_strdup(eff_url);
+                        }
+                    }
+                } else {
+                    s->err = (cc == CURLE_OPERATION_TIMEDOUT) ? AVERROR(ETIMEDOUT) : AVERROR(EIO);
+                }
+            }
+            s->eof = 1;
+            continue;
+        }
+
+        // Wait for activity if still running but no data produced
+        if (s->fill == 0) {
+            int numfds;
+            curl_multi_wait(s->multi, NULL, 0, 100, &numfds);
+        }
+    }
+
+    if (out > 0) s->off += out;
+    return out;
+}
+
+static int64_t mvd_seek(URLContext *h, int64_t off, int whence)
+{
+    MVDCurlHTTPContext *s = h->priv_data;
+
+    if (whence == AVSEEK_SIZE) {
+        return s->content_length > 0 ? s->content_length : -1;
+    }
+
+    if (whence == SEEK_CUR) off += s->off;
+    else if (whence == SEEK_END) {
+        if (s->content_length <= 0) return AVERROR(EINVAL);
+        off = s->content_length + off;
+    } else if (whence != SEEK_SET) return AVERROR(EINVAL);
+
+    if (off < 0) return AVERROR(EINVAL);
+
+    s->off = off;
+    s->request_start = off;
+    return mvd_start(s) < 0 ? AVERROR(EIO) : off;
+}
+
+static int mvd_close(URLContext *h)
+{
+    MVDCurlHTTPContext *s = h->priv_data;
+
+    if (s->multi && s->easy) {
+        curl_multi_remove_handle(s->multi, s->easy);
+    }
+    if (s->multi) {
+        curl_multi_cleanup(s->multi);
+        s->multi = NULL;
+    }
+    if (s->hdr_list) {
+        curl_slist_free_all(s->hdr_list);
+        s->hdr_list = NULL;
+    }
+    if (s->easy) {
+        curl_easy_cleanup(s->easy);
+        s->easy = NULL;
+    }
+
+    av_freep(&s->ring);
+    av_freep(&s->url);
+    av_freep(&s->final_url);
+    av_opt_free(s);
+    return 0;
+}
+
+const URLProtocol ff_http_protocol = {
+    .name               = "http",
+    .url_open2          = mvd_open,
+    .url_read           = mvd_read,
+    .url_seek           = mvd_seek,
+    .url_close          = mvd_close,
+    .priv_data_size     = sizeof(MVDCurlHTTPContext),
+    .priv_data_class    = &mvd_curl_http_class,
+    .flags              = URL_PROTOCOL_FLAG_NETWORK,
+    .default_whitelist  = "http,https,tcp,tls,crypto,httpproxy,data,file"
+};
+
+const URLProtocol ff_https_protocol = {
+    .name               = "https",
+    .url_open2          = mvd_open,
+    .url_read           = mvd_read,
+    .url_seek           = mvd_seek,
+    .url_close          = mvd_close,
+    .priv_data_size     = sizeof(MVDCurlHTTPContext),
+    .priv_data_class    = &mvd_curl_http_class,
+    .flags              = URL_PROTOCOL_FLAG_NETWORK,
+    .default_whitelist  = "http,https,tcp,tls,crypto,httpproxy,data,file"
+};
+
+int ff_http_averror(int status_code, int default_averror)
+{
+    switch (status_code) {
+        case 400: return AVERROR_HTTP_BAD_REQUEST;
+        case 401: return AVERROR_HTTP_UNAUTHORIZED;
+        case 403: return AVERROR_HTTP_FORBIDDEN;
+        case 404: return AVERROR_HTTP_NOT_FOUND;
+        case 429: return AVERROR_HTTP_TOO_MANY_REQUESTS;
+        default: break;
+    }
+    if (status_code >= 400 && status_code <= 499)
+        return AVERROR_HTTP_OTHER_4XX;
+    else if (status_code >= 500)
+        return AVERROR_HTTP_SERVER_ERROR;
+    else
+        return default_averror;
+}
+
+const char* ff_http_get_new_location(URLContext *h)
+{
+    MVDCurlHTTPContext *s = h->priv_data;
+    return s->final_url ? s->final_url : s->url;
+}
+
+void ff_http_init_auth_state(URLContext *dest, const URLContext *src)
+{
+    // No-op for libcurl
+}
+
+int ff_http_do_new_request(URLContext *h, const char *uri)
+{
+    return ff_http_do_new_request2(h, uri, NULL);
+}
+
+int ff_http_do_new_request2(URLContext *h, const char *uri, AVDictionary **options)
+{
+    MVDCurlHTTPContext *s = h->priv_data;
+    int ret;
+
+    if (options) {
+        ret = av_opt_set_dict(s, options);
+        if (ret < 0) return ret;
+    }
+
+    av_freep(&s->url);
+    s->url = av_strdup(uri);
+    if (!s->url) return AVERROR(ENOMEM);
+
+    return mvd_start(s);
+}
+
+#endif // MVD_USE_LIBCURL
+
+#ifndef MVD_USE_LIBCURL
 static const AVOption options[] = {
     { "seekable", "control seekability of connection", OFFSET(seekable), AV_OPT_TYPE_BOOL, { .i64 = -1 }, -1, 1, D },
     { "chunked_post", "use chunked transfer-encoding for posts", OFFSET(chunked_post), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, E },
@@ -2121,111 +2621,20 @@ const URLProtocol ff_https_protocol = {
 #endif /* CONFIG_HTTPS_PROTOCOL */
 
 #if CONFIG_HTTPPROXY_PROTOCOL
-static int http_proxy_close(URLContext *h)
-{
-    HTTPContext *s = h->priv_data;
-    if (s->hd)
-        ffurl_closep(&s->hd);
-    return 0;
-}
-
-static int http_proxy_open(URLContext *h, const char *uri, int flags)
-{
-    HTTPContext *s = h->priv_data;
-    char hostname[1024], hoststr[1024];
-    char auth[1024], pathbuf[1024], *path;
-    char lower_url[100];
-    int port, ret = 0, auth_attempts = 0;
-    HTTPAuthType cur_auth_type;
-    char *authstr;
-
-    if( s->seekable == 1 )
-        h->is_streamed = 0;
-    else
-        h->is_streamed = 1;
-
-    av_url_split(NULL, 0, auth, sizeof(auth), hostname, sizeof(hostname), &port,
-                 pathbuf, sizeof(pathbuf), uri);
-    ff_url_join(hoststr, sizeof(hoststr), NULL, NULL, hostname, port, NULL);
-    path = pathbuf;
-    if (*path == '/')
-        path++;
-
-    ff_url_join(lower_url, sizeof(lower_url), "tcp", NULL, hostname, port,
-                NULL);
-redo:
-    ret = ffurl_open_whitelist(&s->hd, lower_url, AVIO_FLAG_READ_WRITE,
-                               &h->interrupt_callback, NULL,
-                               h->protocol_whitelist, h->protocol_blacklist, h);
-    if (ret < 0)
-        return ret;
-
-    authstr = ff_http_auth_create_response(&s->proxy_auth_state, auth,
-                                           path, "CONNECT");
-    snprintf(s->buffer, sizeof(s->buffer),
-             "CONNECT %s HTTP/1.1\r\n"
-             "Host: %s\r\n"
-             "Connection: close\r\n"
-             "%s%s"
-             "\r\n",
-             path,
-             hoststr,
-             authstr ? "Proxy-" : "", authstr ? authstr : "");
-    av_freep(&authstr);
-
-    if ((ret = ffurl_write(s->hd, s->buffer, strlen(s->buffer))) < 0)
-        goto fail;
-
-    s->buf_ptr    = s->buffer;
-    s->buf_end    = s->buffer;
-    s->line_count = 0;
-    s->filesize   = UINT64_MAX;
-    cur_auth_type = s->proxy_auth_state.auth_type;
-
-    /* Note: This uses buffering, potentially reading more than the
-     * HTTP header. If tunneling a protocol where the server starts
-     * the conversation, we might buffer part of that here, too.
-     * Reading that requires using the proper ffurl_read() function
-     * on this URLContext, not using the fd directly (as the tls
-     * protocol does). This shouldn't be an issue for tls though,
-     * since the client starts the conversation there, so there
-     * is no extra data that we might buffer up here.
-     */
-    ret = http_read_header(h);
-    if (ret < 0)
-        goto fail;
-
-    auth_attempts++;
-    if (s->http_code == 407 &&
-        (cur_auth_type == HTTP_AUTH_NONE || s->proxy_auth_state.stale) &&
-        s->proxy_auth_state.auth_type != HTTP_AUTH_NONE && auth_attempts < 2) {
-        ffurl_closep(&s->hd);
-        goto redo;
-    }
-
-    if (s->http_code < 400)
-        return 0;
-    ret = ff_http_averror(s->http_code, AVERROR(EIO));
-
-fail:
-    http_proxy_close(h);
-    return ret;
-}
-
-static int http_proxy_write(URLContext *h, const uint8_t *buf, int size)
-{
-    HTTPContext *s = h->priv_data;
-    return ffurl_write(s->hd, buf, size);
-}
+HTTP_CLASS(httpproxy);
 
 const URLProtocol ff_httpproxy_protocol = {
     .name                = "httpproxy",
     .url_open            = http_proxy_open,
-    .url_read            = http_buf_read,
-    .url_write           = http_proxy_write,
+    .url_read            = http_read,
+    .url_write           = http_write,
+    .url_seek            = http_seek,
     .url_close           = http_proxy_close,
     .url_get_file_handle = http_get_file_handle,
     .priv_data_size      = sizeof(HTTPContext),
+    .priv_data_class     = &httpproxy_context_class,
     .flags               = URL_PROTOCOL_FLAG_NETWORK,
 };
 #endif /* CONFIG_HTTPPROXY_PROTOCOL */
+
+#endif // !MVD_USE_LIBCURL

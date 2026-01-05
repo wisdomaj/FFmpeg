@@ -68,6 +68,10 @@ static int set_options(TLSShared *c, const char *uri)
 
 int ff_tls_open_underlying(TLSShared *c, URLContext *parent, const char *uri, AVDictionary **options)
 {
+    #ifdef MVD_USE_LIBCURL
+    // When MVD_USE_LIBCURL is enabled, HTTPS is handled by libcurl in libavformat/http.c.
+    // TLS remains available for other protocols that still use FFmpeg's internal URLProtocols.
+    #endif
     int port;
     const char *p;
     char buf[200], opts[50] = "";
