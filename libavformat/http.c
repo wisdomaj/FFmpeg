@@ -193,7 +193,8 @@ static int parse_http_date(const char *date_str, struct tm *buf)
 #include "libavutil/error.h"
 #include <stdatomic.h>
 
-#define MVD_CURL_RING_CAP (4 * 1024 * 1024)  // 4 MiB bounded buffer
+// Keep buffering small: HLS can open many connections; large per-connection buffers cause ENOMEM.
+#define MVD_CURL_RING_CAP (256 * 1024)  // 256 KiB bounded buffer
 
 typedef struct MVDCurlHTTPContext {
     const AVClass *class;
@@ -1121,7 +1122,8 @@ static int mvd_read_once(URLContext *h, uint8_t *buf, int size)
                 out += (int)rem;
             }
 
-            if (s->paused && (s->cap - s->fill) >= 64 * 1024) {
+            // Resume once we have a decent amount of free space.
+            if (s->paused && (s->cap - s->fill) >= (s->cap / 2)) {
                 s->paused = 0;
                 curl_easy_pause(s->easy, CURLPAUSE_CONT);
             }
