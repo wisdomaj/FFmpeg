@@ -212,6 +212,7 @@ typedef struct MVDCurlHTTPContext {
     char *location_header;
     char *content_encoding;
     char *set_cookie_headers;
+    char *cookie_jar;
     int accept_ranges;
     int header_status_line_seen;
     int64_t content_range_total;
@@ -249,7 +250,7 @@ static const AVOption mvd_curl_http_options[] = {
     { "headers",    "set custom HTTP headers",            MVD_OFFSET(headers),    AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D | E },
     { "user_agent", "override User-Agent header",         MVD_OFFSET(user_agent), AV_OPT_TYPE_STRING, { .str = DEFAULT_USER_AGENT }, 0, 0, D },
     { "referer",    "override referer header",            MVD_OFFSET(referer),    AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
-    { "cookies",    "cookies to send (Cookie: value)",    MVD_OFFSET(cookies),    AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+    { "cookies",    "newline-delimited Set-Cookie values for curl COOKIELIST",    MVD_OFFSET(cookies),    AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "http_proxy",  "set HTTP proxy to tunnel through", MVD_OFFSET(http_proxy), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "no_proxy",    "comma separated hostlist to not proxy", MVD_OFFSET(no_proxy),   AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "offset",     "initial byte offset",                MVD_OFFSET(off),        AV_OPT_TYPE_INT64,  { .i64 = 0 },    0, INT64_MAX, D },
@@ -371,13 +372,13 @@ static int mvd_handle_icy_metadata(MVDCurlHTTPContext *s)
         return ret;
 
     int len = header * 16;
+    if (len > 255 * 16 || len < 0)
+        return AVERROR(EINVAL);
+
     if (!len) {
         s->icy_data_read = 0;
         return 0;
     }
-
-    if (len > 255 * 16)
-        return AVERROR(EINVAL);
 
     char *data = av_malloc(len + 1);
     if (!data)
@@ -387,6 +388,10 @@ static int mvd_handle_icy_metadata(MVDCurlHTTPContext *s)
     if (ret < 0) {
         av_free(data);
         return ret;
+    }
+    if (ret != len) {
+        av_free(data);
+        return AVERROR(EIO);
     }
     data[len] = '\0';
 
@@ -473,6 +478,42 @@ static int mvd_append_line(char **dst, const char *line)
     av_free(*dst);
     *dst = tmp;
     return 0;
+}
+
+static void mvd_feed_cookie_list(CURL *easy, const char *list, int add_prefix)
+{
+    if (!easy || !list)
+        return;
+
+    char *copy = av_strdup(list);
+    if (!copy)
+        return;
+
+    char *token = NULL;
+    char *saveptr = NULL;
+    for (token = av_strtok(copy, "\n", &saveptr); token; token = av_strtok(NULL, "\n", &saveptr)) {
+        char *command = NULL;
+        const char *cmd = token;
+        if (add_prefix) {
+            if (!(av_strncasecmp(token, "Set-Cookie:", 11) == 0 ||
+                  av_strncasecmp(token, "Set-Cookie2:", 12) == 0 ||
+                  strchr(token, '\t') ||
+                  token[0] == '#')) {
+                command = av_asprintf("Set-Cookie: %s", token);
+                if (command)
+                    cmd = command;
+            }
+        }
+        curl_easy_setopt(easy, CURLOPT_COOKIELIST, cmd);
+        av_free(command);
+    }
+
+    av_free(copy);
+}
+
+static void mvd_feed_cookie_jar(MVDCurlHTTPContext *s)
+{
+    mvd_feed_cookie_list(s->easy, s->cookie_jar, 0);
 }
 
 static int mvd_store_icy_header(MVDCurlHTTPContext *s, const char *tag, const char *value)
@@ -589,6 +630,11 @@ static void mvd_handle_header_line(MVDCurlHTTPContext *s, const char *name, cons
         s->content_encoding = av_strdup(value);
     } else if (!av_strcasecmp(name, "set-cookie")) {
         mvd_append_line(&s->set_cookie_headers, value);
+        char *cookie_line = av_asprintf("Set-Cookie: %s", value);
+        if (cookie_line) {
+            mvd_append_line(&s->cookie_jar, cookie_line);
+            av_free(cookie_line);
+        }
     } else if (!av_strncasecmp(name, "icy-", 4)) {
         if (!av_strcasecmp(name, "icy-metaint"))
             s->icy_metaint = strtoll(value, NULL, 10);
@@ -646,8 +692,10 @@ static size_t mvd_header_cb(char *ptr, size_t size, size_t nmemb, void *userdata
 
     if (len) {
         if (av_stristart(line, "HTTP/", NULL) || av_stristart(line, "ICY ", NULL)) {
-            if (s->header_status_line_seen)
+            if (s->header_status_line_seen) {
                 mvd_reset_header_state(s);
+                s->request_start = s->off;
+            }
 
             char version[32];
             int code = 0;
@@ -723,7 +771,7 @@ static int mvd_prepare_easy(MVDCurlHTTPContext *s)
     curl_easy_setopt(s->easy, CURLOPT_MAXREDIRS, 8L);
     curl_easy_setopt(s->easy, CURLOPT_WRITEFUNCTION, mvd_write_cb);
     curl_easy_setopt(s->easy, CURLOPT_WRITEDATA, s);
-    curl_easy_setopt(s->easy, CURLOPT_ACCEPT_ENCODING, "identity");
+    curl_easy_setopt(s->easy, CURLOPT_ACCEPT_ENCODING, "");
 
     char *env_http_proxy = NULL;
     char *env_no_proxy = NULL;
@@ -753,7 +801,9 @@ static int mvd_prepare_easy(MVDCurlHTTPContext *s)
     freeenv_utf8(env_no_proxy);
 
     curl_easy_setopt(s->easy, CURLOPT_COOKIEFILE, "");
-    curl_easy_setopt(s->easy, CURLOPT_COOKIEJAR, "");
+    mvd_feed_cookie_jar(s);
+    if (s->cookies && *s->cookies)
+        mvd_feed_cookie_list(s->easy, s->cookies, 1);
 
     if (s->timeout_us > 0)
         curl_easy_setopt(s->easy, CURLOPT_CONNECTTIMEOUT_MS, (long)FFMAX(1, s->timeout_us / 1000));
@@ -770,8 +820,6 @@ static int mvd_prepare_easy(MVDCurlHTTPContext *s)
         curl_easy_setopt(s->easy, CURLOPT_USERAGENT, s->user_agent);
     if (s->referer && *s->referer)
         curl_easy_setopt(s->easy, CURLOPT_REFERER, s->referer);
-    if (s->cookies && *s->cookies)
-        curl_easy_setopt(s->easy, CURLOPT_COOKIE, s->cookies);
 
     if (s->hdr_list) {
         curl_slist_free_all(s->hdr_list);
@@ -796,7 +844,7 @@ static int mvd_prepare_easy(MVDCurlHTTPContext *s)
 #endif
 
     if (!(s->h->flags & AVIO_FLAG_WRITE)) {
-        if (s->request_start > 0 || s->end_off > 0 || s->seekable != 0) {
+        if (s->request_start > 0 || s->end_off > 0) {
             char range[128];
             if (s->end_off && s->end_off > s->request_start) {
                 snprintf(range, sizeof(range), "bytes=%"PRId64"-%"PRId64, s->request_start, s->end_off - 1);
@@ -857,6 +905,11 @@ static int mvd_open(URLContext *h, const char *uri, int flags, AVDictionary **op
     s->class = &mvd_curl_http_class;
     s->h = h;
     av_opt_set_defaults(s);
+    s->cookie_jar = av_strdup("");
+    if (!s->cookie_jar) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
 
     if (options) {
         ret = av_opt_set_dict(s, options);
@@ -1092,6 +1145,7 @@ static int mvd_close(URLContext *h)
     av_freep(&s->location_header);
     av_freep(&s->content_encoding);
     av_freep(&s->set_cookie_headers);
+    av_freep(&s->cookie_jar);
     av_freep(&s->icy_metadata_headers);
     av_freep(&s->icy_metadata_packet);
     av_dict_free(&s->metadata);
@@ -1191,6 +1245,7 @@ int ff_http_do_new_request2(URLContext *h, const char *uri, AVDictionary **optio
     s->off = 0;
     s->request_start = 0;
 
+    mvd_reset_header_state(s);
     return mvd_start(s);
 }
 
