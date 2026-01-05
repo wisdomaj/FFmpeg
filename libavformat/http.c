@@ -24,8 +24,10 @@
 #include "config.h"
 #include "config_components.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <limits.h>
 #if CONFIG_ZLIB
 #include <zlib.h>
 #endif /* CONFIG_ZLIB */
@@ -39,6 +41,7 @@
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
 #include "libavutil/parseutils.h"
+#include "libavutil/dict.h"
 
 #include "avformat.h"
 #include "http.h"
@@ -156,12 +159,15 @@ typedef struct HTTPContext {
 #define E AV_OPT_FLAG_ENCODING_PARAM
 #define DEFAULT_USER_AGENT "Lavf/" AV_STRINGIFY(LIBAVFORMAT_VERSION)
 
+static int parse_http_date(const char *date_str, struct tm *buf);
+
 #ifdef MVD_USE_LIBCURL
 
 #include <curl/curl.h>
 #include <inttypes.h>
 #include <errno.h>
 #include "libavutil/error.h"
+#include "libavutil/atomic.h"
 
 #define MVD_CURL_RING_CAP (4 * 1024 * 1024)  // 4 MiB bounded buffer
 
@@ -174,8 +180,11 @@ typedef struct MVDCurlHTTPContext {
     char *referer;
     char *headers;   // CRLF-separated header lines
     char *cookies;   // treated as Cookie: value
+    char *http_proxy;
+    char *no_proxy;
 
     int64_t off;
+    int64_t end_off;
     int seekable;
 
     int timeout_us;
@@ -199,6 +208,21 @@ typedef struct MVDCurlHTTPContext {
     int err;
     int64_t content_length; // best-effort
     long http_code;
+    char *http_version;
+    char *location_header;
+    char *content_encoding;
+    char *set_cookie_headers;
+    int accept_ranges;
+    int header_status_line_seen;
+    int64_t content_range_total;
+    int64_t content_range_start;
+    int last_curl_code;
+    int icy;
+    char *icy_metadata_headers;
+    char *icy_metadata_packet;
+    AVDictionary *metadata;
+    int64_t icy_metaint;
+    int64_t icy_data_read;
 
     CURL *easy;
     CURLM *multi;
@@ -217,6 +241,7 @@ typedef struct MVDCurlHTTPContext {
 // Forward declarations (C99 forbids implicit function declarations)
 static int mvd_open(URLContext *h, const char *uri, int flags, AVDictionary **options);
 static int mvd_read(URLContext *h, uint8_t *buf, int size);
+static int mvd_read_once(URLContext *h, uint8_t *buf, int size);
 static int64_t mvd_seek(URLContext *h, int64_t off, int whence);
 static int mvd_close(URLContext *h);
 
@@ -225,10 +250,21 @@ static const AVOption mvd_curl_http_options[] = {
     { "user_agent", "override User-Agent header",         MVD_OFFSET(user_agent), AV_OPT_TYPE_STRING, { .str = DEFAULT_USER_AGENT }, 0, 0, D },
     { "referer",    "override referer header",            MVD_OFFSET(referer),    AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "cookies",    "cookies to send (Cookie: value)",    MVD_OFFSET(cookies),    AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+    { "http_proxy",  "set HTTP proxy to tunnel through", MVD_OFFSET(http_proxy), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+    { "no_proxy",    "comma separated hostlist to not proxy", MVD_OFFSET(no_proxy),   AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "offset",     "initial byte offset",                MVD_OFFSET(off),        AV_OPT_TYPE_INT64,  { .i64 = 0 },    0, INT64_MAX, D },
-    { "seekable",   "control seekability of connection",  MVD_OFFSET(seekable),   AV_OPT_TYPE_BOOL,   { .i64 = -1 },  -1, 1, D },
+    { "end_offset", "try to limit the request to bytes preceding this offset", MVD_OFFSET(end_off), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
+    { "seekable",   "control seekability of connection",  MVD_OFFSET(seekable),   AV_OPT_TYPE_INT,    { .i64 = -1 },  -1, 1, D },
     { "timeout",    "connection timeout in microseconds", MVD_OFFSET(timeout_us), AV_OPT_TYPE_INT,    { .i64 = 0 },     0, INT_MAX, D },
     { "rw_timeout", "read/write timeout in microseconds", MVD_OFFSET(rw_timeout_us), AV_OPT_TYPE_INT, { .i64 = 0 },  0, INT_MAX, D },
+    { "http_version", "export HTTP version",              MVD_OFFSET(http_version), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
+    { "location",     "Location header value",            MVD_OFFSET(location_header), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
+    { "icy",         "request ICY metadata",              MVD_OFFSET(icy), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, D },
+    { "icy_metadata_headers", "return ICY metadata headers",   MVD_OFFSET(icy_metadata_headers), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT },
+    { "icy_metadata_packet",  "return current ICY metadata packet", MVD_OFFSET(icy_metadata_packet), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT },
+    { "metadata",     "metadata read from the bitstream", MVD_OFFSET(metadata), AV_OPT_TYPE_DICT, {0}, 0, 0, AV_OPT_FLAG_EXPORT },
+    { "content_encoding", "Content-Encoding header",        MVD_OFFSET(content_encoding), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
+    { "set_cookie_headers", "Set-Cookie headers",          MVD_OFFSET(set_cookie_headers), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
 
     // Insert FFmpeg http.c compatible options for CLI compatibility and retry logic
     { "reconnect", "auto reconnect after disconnect before EOF", MVD_OFFSET(reconnect), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
@@ -268,6 +304,133 @@ static int mvd_xferinfo_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
     return mvd_should_abort(s) ? 1 : 0;
 }
 
+static int mvd_is_curl_network_error(CURLcode code)
+{
+    switch (code) {
+    case CURLE_COULDNT_CONNECT:
+    case CURLE_OPERATION_TIMEDOUT:
+    case CURLE_SSL_CONNECT_ERROR:
+    case CURLE_SEND_ERROR:
+    case CURLE_RECV_ERROR:
+    case CURLE_GOT_NOTHING:
+    case CURLE_PARTIAL_FILE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int mvd_read_full(MVDCurlHTTPContext *s, uint8_t *buf, int size)
+{
+    URLContext *h = s->h;
+    int total = 0;
+
+    while (total < size) {
+        int ret = mvd_read_once(h, buf + total, size - total);
+        if (ret <= 0)
+            return total ? total : ret;
+        total += ret;
+    }
+    return total;
+}
+
+static void mvd_update_metadata(MVDCurlHTTPContext *s, char *data)
+{
+    char *key;
+    char *val;
+    char *end;
+    char *next = data;
+    URLContext *h = s->h;
+
+    while (*next) {
+        key = next;
+        val = strstr(key, "='");
+        if (!val)
+            break;
+        end = strstr(val, "';");
+        if (!end)
+            break;
+
+        *val = '\0';
+        *end = '\0';
+        val += 2;
+
+        av_dict_set(&s->metadata, key, val, 0);
+        av_log(h, AV_LOG_VERBOSE, "Metadata update for %s: %s\n", key, val);
+
+        next = end + 2;
+    }
+}
+
+static int mvd_handle_icy_metadata(MVDCurlHTTPContext *s)
+{
+    URLContext *h = s->h;
+    uint8_t header;
+    int ret = mvd_read_full(s, &header, 1);
+    if (ret <= 0)
+        return ret;
+
+    int len = header * 16;
+    if (!len) {
+        s->icy_data_read = 0;
+        return 0;
+    }
+
+    if (len > 255 * 16)
+        return AVERROR(EINVAL);
+
+    char *data = av_malloc(len + 1);
+    if (!data)
+        return AVERROR(ENOMEM);
+
+    ret = mvd_read_full(s, (uint8_t *)data, len);
+    if (ret < 0) {
+        av_free(data);
+        return ret;
+    }
+    data[len] = '\0';
+
+    ret = av_opt_set(s, "icy_metadata_packet", data, 0);
+    if (ret >= 0)
+        mvd_update_metadata(s, data);
+    av_free(data);
+
+    s->icy_data_read = 0;
+    return ret;
+}
+
+static int mvd_read_data(URLContext *h, uint8_t *buf, int size)
+{
+    MVDCurlHTTPContext *s = h->priv_data;
+    if (s->icy_metaint <= 0)
+        return mvd_read_once(h, buf, size);
+
+    int total = 0;
+    while (total < size) {
+        int64_t remaining = s->icy_metaint - s->icy_data_read;
+        if (remaining <= 0) {
+            int ret = mvd_handle_icy_metadata(s);
+            if (ret < 0)
+                return ret;
+            continue;
+        }
+
+        int read_size = FFMIN(size - total, (int)remaining);
+        int ret = mvd_read_once(h, buf + total, read_size);
+        if (ret <= 0)
+            return total ? total : ret;
+        total += ret;
+        s->icy_data_read += ret;
+
+        if (s->icy_data_read >= s->icy_metaint) {
+            int meta_ret = mvd_handle_icy_metadata(s);
+            if (meta_ret < 0)
+                return meta_ret;
+        }
+    }
+    return total;
+}
+
 static int mvd_build_headers(MVDCurlHTTPContext *s)
 {
     if (!s->headers) return 0;
@@ -287,6 +450,234 @@ static int mvd_build_headers(MVDCurlHTTPContext *s)
         p = e + 2;
     }
     return 0;
+}
+
+static int mvd_has_header(const char *headers, const char *needle)
+{
+    if (!headers || !needle)
+        return 0;
+    return av_stristr(headers, needle) != NULL;
+}
+
+static int mvd_append_line(char **dst, const char *line)
+{
+    if (!line || !*line)
+        return 0;
+
+    if (!*dst)
+        return (*dst = av_strdup(line)) ? 0 : AVERROR(ENOMEM);
+
+    char *tmp = av_asprintf("%s\n%s", *dst, line);
+    if (!tmp)
+        return AVERROR(ENOMEM);
+    av_free(*dst);
+    *dst = tmp;
+    return 0;
+}
+
+static int mvd_store_icy_header(MVDCurlHTTPContext *s, const char *tag, const char *value)
+{
+    int ret = av_dict_set(&s->metadata, tag, value, 0);
+    if (ret < 0)
+        return ret;
+
+    char *line = av_asprintf("%s: %s", tag, value ? value : "");
+    if (!line)
+        return AVERROR(ENOMEM);
+    ret = mvd_append_line(&s->icy_metadata_headers, line);
+    av_free(line);
+    return ret;
+}
+
+static void mvd_reset_header_state(MVDCurlHTTPContext *s)
+{
+    av_freep(&s->http_version);
+    av_freep(&s->content_encoding);
+    av_freep(&s->location_header);
+    av_freep(&s->set_cookie_headers);
+    av_freep(&s->icy_metadata_headers);
+    av_freep(&s->icy_metadata_packet);
+    av_dict_free(&s->metadata);
+    s->metadata = NULL;
+    s->accept_ranges = 0;
+    s->content_range_total = -1;
+    s->content_range_start = -1;
+    s->header_status_line_seen = 0;
+    s->content_length = -1;
+    s->retry_after = 0;
+    s->icy_metaint = 0;
+    s->last_curl_code = CURLE_OK;
+}
+
+static void mvd_parse_content_range(MVDCurlHTTPContext *s, const char *value)
+{
+    const char *p;
+    if (!value || !av_stristart(value, "bytes ", &p))
+        return;
+
+    char *endptr = NULL;
+    int64_t start = strtoll(p, &endptr, 10);
+    if (!endptr || *endptr != '-')
+        return;
+
+    int64_t end = strtoll(endptr + 1, &endptr, 10);
+    if (!endptr || *endptr != '/')
+        return;
+
+    int64_t total = -1;
+    if (endptr[1] && endptr[1] != '*')
+        total = strtoll(endptr + 1, NULL, 10);
+
+    s->content_range_start = start;
+    if (total > 0) {
+        s->content_range_total = total;
+        s->content_length = total;
+    }
+
+    if (s->seekable != 0 && s->h && total > 0)
+        s->h->is_streamed = 0;
+}
+
+static void mvd_handle_header_line(MVDCurlHTTPContext *s, const char *name, const char *value)
+{
+    if (!name || !value)
+        return;
+
+    while (*name == ' ' || *name == '\t')
+        name++;
+
+    if (!*name)
+        return;
+
+    if (!av_strcasecmp(name, "content-length")) {
+        int64_t len = strtoll(value, NULL, 10);
+        if (len >= 0 && s->content_range_total <= 0)
+            s->content_length = s->request_start + len;
+    } else if (!av_strcasecmp(name, "content-range")) {
+        mvd_parse_content_range(s, value);
+    } else if (!av_strcasecmp(name, "accept-ranges")) {
+        s->accept_ranges = av_stristr(value, "bytes") != NULL;
+        if (s->accept_ranges && s->seekable != 0 && s->h)
+            s->h->is_streamed = 0;
+    } else if (!av_strcasecmp(name, "location")) {
+        char resolved[MAX_URL_SIZE];
+        ff_make_absolute_url(resolved, sizeof(resolved), s->url, value);
+        av_freep(&s->location_header);
+        s->location_header = av_strdup(resolved);
+    } else if (!av_strcasecmp(name, "retry-after")) {
+        unsigned long delay = 0;
+        char *endptr = NULL;
+        delay = strtoul(value, &endptr, 10);
+        if (endptr == value) {
+            struct tm tm = {0};
+            if (!parse_http_date(value, &tm)) {
+                int64_t retry = av_timegm(&tm);
+                int64_t now = av_gettime() / 1000000;
+                int64_t diff = retry - now;
+                if (diff < 0)
+                    diff = 0;
+                if (diff > UINT_MAX)
+                    delay = UINT_MAX;
+                else
+                    delay = (unsigned long)diff;
+            }
+        }
+        if (delay > 0)
+            s->retry_after = (unsigned int)delay;
+    } else if (!av_strcasecmp(name, "content-encoding")) {
+        av_freep(&s->content_encoding);
+        s->content_encoding = av_strdup(value);
+    } else if (!av_strcasecmp(name, "set-cookie")) {
+        mvd_append_line(&s->set_cookie_headers, value);
+    } else if (!av_strncasecmp(name, "icy-", 4)) {
+        if (!av_strcasecmp(name, "icy-metaint"))
+            s->icy_metaint = strtoll(value, NULL, 10);
+        mvd_store_icy_header(s, name, value);
+    }
+}
+
+static int mvd_should_retry_http_code(MVDCurlHTTPContext *s, long code)
+{
+    if (!s->reconnect_on_http_error || code < 0)
+        return 0;
+
+    char *list = av_strdup(s->reconnect_on_http_error);
+    if (!list)
+        return 0;
+
+    char *tok = NULL, *saveptr = NULL;
+    int should = 0;
+    for (tok = av_strtok(list, ", \t", &saveptr); tok; tok = av_strtok(NULL, ", \t", &saveptr)) {
+        int len = strlen(tok);
+        if (len == 3 && (tok[1] == 'x' || tok[1] == 'X') && (tok[2] == 'x' || tok[2] == 'X') && tok[0] >= '0' && tok[0] <= '9') {
+            int prefix = tok[0] - '0';
+            if (code >= prefix * 100 && code < (prefix + 1) * 100) {
+                should = 1;
+                break;
+            }
+        } else {
+            char *end = NULL;
+            long target = strtol(tok, &end, 10);
+            if (end != tok && target == code) {
+                should = 1;
+                break;
+            }
+        }
+    }
+
+    av_free(list);
+    return should;
+}
+
+static size_t mvd_header_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
+{
+    MVDCurlHTTPContext *s = userdata;
+    size_t total = size * nmemb;
+    if (!total)
+        return 0;
+
+    char *line = av_strndup(ptr, total);
+    if (!line)
+        return 0;
+
+    size_t len = total;
+    while (len && (line[len - 1] == '\r' || line[len - 1] == '\n'))
+        line[--len] = '\0';
+
+    if (len) {
+        if (av_stristart(line, "HTTP/", NULL) || av_stristart(line, "ICY ", NULL)) {
+            if (s->header_status_line_seen)
+                mvd_reset_header_state(s);
+
+            char version[32];
+            int code = 0;
+            if (sscanf(line, "%31s %d", version, &code) >= 2) {
+                s->http_code = code;
+                av_freep(&s->http_version);
+                s->http_version = av_strdup(version);
+                s->header_status_line_seen = 1;
+            }
+        } else {
+            char *colon = strchr(line, ':');
+            if (colon) {
+                *colon = '\0';
+                char *name = line;
+                char *value = colon + 1;
+                while (*value == ' ' || *value == '\t')
+                    value++;
+                char *value_end = value + strlen(value);
+                while (value_end > value && (*(value_end - 1) == ' ' || *(value_end - 1) == '\t'))
+                    *--value_end = '\0';
+                char *end = colon;
+                while (end > name && (*(end - 1) == ' ' || *(end - 1) == '\t'))
+                    *--end = '\0';
+                mvd_handle_header_line(s, name, value);
+            }
+        }
+    }
+
+    av_free(line);
+    return total;
 }
 
 static size_t mvd_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
@@ -326,16 +717,54 @@ static int mvd_prepare_easy(MVDCurlHTTPContext *s)
     }
 
     curl_easy_setopt(s->easy, CURLOPT_URL, s->url);
+    curl_easy_setopt(s->easy, CURLOPT_HEADERFUNCTION, mvd_header_cb);
+    curl_easy_setopt(s->easy, CURLOPT_HEADERDATA, s);
     curl_easy_setopt(s->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(s->easy, CURLOPT_MAXREDIRS, 8L);
     curl_easy_setopt(s->easy, CURLOPT_WRITEFUNCTION, mvd_write_cb);
     curl_easy_setopt(s->easy, CURLOPT_WRITEDATA, s);
-    curl_easy_setopt(s->easy, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(s->easy, CURLOPT_ACCEPT_ENCODING, "identity");
+
+    char *env_http_proxy = NULL;
+    char *env_no_proxy = NULL;
+    const char *proxy = s->http_proxy;
+    if (!proxy) {
+        env_http_proxy = getenv_utf8("http_proxy");
+        if (!env_http_proxy)
+            env_http_proxy = getenv_utf8("HTTP_PROXY");
+        proxy = env_http_proxy;
+    }
+    if (proxy && *proxy) {
+        curl_easy_setopt(s->easy, CURLOPT_PROXY, proxy);
+        curl_easy_setopt(s->easy, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
+    }
+
+    const char *noproxy = s->no_proxy;
+    if (!noproxy) {
+        env_no_proxy = getenv_utf8("no_proxy");
+        if (!env_no_proxy)
+            env_no_proxy = getenv_utf8("NO_PROXY");
+        noproxy = env_no_proxy;
+    }
+    if (noproxy && *noproxy)
+        curl_easy_setopt(s->easy, CURLOPT_NOPROXY, noproxy);
+
+    freeenv_utf8(env_http_proxy);
+    freeenv_utf8(env_no_proxy);
+
+    curl_easy_setopt(s->easy, CURLOPT_COOKIEFILE, "");
+    curl_easy_setopt(s->easy, CURLOPT_COOKIEJAR, "");
 
     if (s->timeout_us > 0)
         curl_easy_setopt(s->easy, CURLOPT_CONNECTTIMEOUT_MS, (long)FFMAX(1, s->timeout_us / 1000));
-    if (s->rw_timeout_us > 0)
-        curl_easy_setopt(s->easy, CURLOPT_TIMEOUT_MS, (long)FFMAX(1, s->rw_timeout_us / 1000));
+    if (s->rw_timeout_us > 0) {
+        long secs = (long)FFMAX(1, (s->rw_timeout_us + 999999) / 1000000);
+        curl_easy_setopt(s->easy, CURLOPT_LOW_SPEED_TIME, secs);
+        curl_easy_setopt(s->easy, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    } else {
+        curl_easy_setopt(s->easy, CURLOPT_LOW_SPEED_TIME, 0L);
+        curl_easy_setopt(s->easy, CURLOPT_LOW_SPEED_LIMIT, 0L);
+    }
 
     if (s->user_agent && *s->user_agent)
         curl_easy_setopt(s->easy, CURLOPT_USERAGENT, s->user_agent);
@@ -351,6 +780,11 @@ static int mvd_prepare_easy(MVDCurlHTTPContext *s)
     {
         int ret = mvd_build_headers(s);
         if (ret < 0) return ret;
+
+        // ICY support: request metadata unless user already supplied Icy-MetaData header.
+        if (s->icy && !mvd_has_header(s->headers, "Icy-MetaData"))
+            s->hdr_list = curl_slist_append(s->hdr_list, "Icy-MetaData: 1");
+
         if (s->hdr_list)
             curl_easy_setopt(s->easy, CURLOPT_HTTPHEADER, s->hdr_list);
     }
@@ -361,10 +795,20 @@ static int mvd_prepare_easy(MVDCurlHTTPContext *s)
     curl_easy_setopt(s->easy, CURLOPT_NOPROGRESS, 0L);
 #endif
 
-    if (s->request_start > 0) {
-        char range[64];
-        snprintf(range, sizeof(range), "bytes=%"PRId64"-", s->request_start);
-        curl_easy_setopt(s->easy, CURLOPT_RANGE, range);
+    if (!(s->h->flags & AVIO_FLAG_WRITE)) {
+        if (s->request_start > 0 || s->end_off > 0 || s->seekable != 0) {
+            char range[128];
+            if (s->end_off && s->end_off > s->request_start) {
+                snprintf(range, sizeof(range), "bytes=%"PRId64"-%"PRId64, s->request_start, s->end_off - 1);
+            } else {
+                snprintf(range, sizeof(range), "bytes=%"PRId64"-", s->request_start);
+            }
+            curl_easy_setopt(s->easy, CURLOPT_RANGE, range);
+        } else {
+            curl_easy_setopt(s->easy, CURLOPT_RANGE, NULL);
+        }
+    } else {
+        curl_easy_setopt(s->easy, CURLOPT_RANGE, NULL);
     }
 
     curl_easy_setopt(s->easy, CURLOPT_TCP_KEEPALIVE, 1L);
@@ -379,6 +823,7 @@ static int mvd_start(MVDCurlHTTPContext *s)
     s->err = 0;
     s->paused = 0;
     s->content_length = -1;
+    mvd_reset_header_state(s);
 
     if (s->multi) {
         if (s->easy) curl_multi_remove_handle(s->multi, s->easy);
@@ -400,16 +845,18 @@ static int mvd_open(URLContext *h, const char *uri, int flags, AVDictionary **op
 {
     MVDCurlHTTPContext *s = h->priv_data;
     int ret;
-    static int mvd_curl_inited = 0;
+    static atomic_int mvd_curl_inited = 0;
 
     (void)flags;
-    if (!mvd_curl_inited) {
-        curl_global_init(CURL_GLOBAL_DEFAULT);
-        mvd_curl_inited = 1;
+    if (!atomic_load(&mvd_curl_inited)) {
+        if (!atomic_exchange(&mvd_curl_inited, 1)) {
+            curl_global_init(CURL_GLOBAL_DEFAULT);
+        }
     }
 
     s->class = &mvd_curl_http_class;
     s->h = h;
+    av_opt_set_defaults(s);
 
     if (options) {
         ret = av_opt_set_dict(s, options);
@@ -443,7 +890,7 @@ fail:
     return ret;
 }
 
-static int mvd_read(URLContext *h, uint8_t *buf, int size)
+static int mvd_read_once(URLContext *h, uint8_t *buf, int size)
 {
     MVDCurlHTTPContext *s = h->priv_data;
     int out = 0;
@@ -486,9 +933,12 @@ static int mvd_read(URLContext *h, uint8_t *buf, int size)
 
         if (!running) {
             int msgs;
-            CURLMsg *msg = curl_multi_info_read(s->multi, &msgs);
-            if (msg && msg->msg == CURLMSG_DONE) {
+            CURLMsg *msg;
+            while ((msg = curl_multi_info_read(s->multi, &msgs))) {
+                if (msg->msg != CURLMSG_DONE)
+                    continue;
                 CURLcode cc = msg->data.result;
+                s->last_curl_code = cc;
                 curl_easy_getinfo(s->easy, CURLINFO_RESPONSE_CODE, &s->http_code);
                 if (cc == CURLE_OK) {
                     if (s->http_code >= 400) {
@@ -505,9 +955,9 @@ static int mvd_read(URLContext *h, uint8_t *buf, int size)
                         }
                     } else {
                         curl_off_t clen = -1;
-                        if (curl_easy_getinfo(s->easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &clen) == CURLE_OK && clen >= 0)
+                        if (curl_easy_getinfo(s->easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &clen) == CURLE_OK && clen >= 0 && s->content_length < 0)
                             s->content_length = (int64_t)clen + s->request_start;
-                        
+
                         char *eff_url = NULL;
                         if (curl_easy_getinfo(s->easy, CURLINFO_EFFECTIVE_URL, &eff_url) == CURLE_OK && eff_url) {
                             av_freep(&s->final_url);
@@ -515,6 +965,7 @@ static int mvd_read(URLContext *h, uint8_t *buf, int size)
                         }
                     }
                 } else {
+                    s->http_code = 0;
                     s->err = (cc == CURLE_OPERATION_TIMEDOUT) ? AVERROR(ETIMEDOUT) : AVERROR(EIO);
                 }
             }
@@ -531,6 +982,66 @@ static int mvd_read(URLContext *h, uint8_t *buf, int size)
 
     if (out > 0) s->off += out;
     return out;
+}
+
+static int mvd_read(URLContext *h, uint8_t *buf, int size)
+{
+    MVDCurlHTTPContext *s = h->priv_data;
+    int reconnect_delay = 0;
+    int reconnect_delay_total = 0;
+    int conn_attempts = 1;
+
+    while (1) {
+        int ret = mvd_read_data(h, buf, size);
+        if (ret >= 0 || ret == AVERROR_EXIT)
+            return ret;
+
+        if (h->is_streamed && !s->reconnect_streamed)
+            return ret;
+
+        bool is_http_error = s->http_code >= 400;
+        bool network_error = mvd_is_curl_network_error(s->last_curl_code);
+        int64_t target = h->is_streamed ? 0 : s->off;
+        bool is_premature = s->content_length > 0 && s->off < s->content_length;
+        bool should_retry = false;
+
+        if (network_error && s->reconnect_on_network_error)
+            should_retry = true;
+        if (is_http_error && mvd_should_retry_http_code(s, s->http_code))
+            should_retry = true;
+        if (s->reconnect && !h->is_streamed && is_premature)
+            should_retry = true;
+        if (s->reconnect_at_eof && ret == AVERROR_EOF)
+            should_retry = true;
+
+        if (!should_retry)
+            return ret;
+
+        if (reconnect_delay > s->reconnect_delay_max ||
+            (s->reconnect_max_retries >= 0 && conn_attempts > s->reconnect_max_retries) ||
+            reconnect_delay_total > s->reconnect_delay_total_max)
+            return ret;
+
+        unsigned int delay = reconnect_delay;
+        if (s->respect_retry_after && s->retry_after > 0)
+            delay = FFMAX(delay, s->retry_after);
+
+        av_log(h, AV_LOG_WARNING, "Will reconnect at %"PRIu64" in %u second(s), error=%s.\n",
+               target, delay, av_err2str(ret));
+
+        int sleep_ret = ff_network_sleep_interruptible(delay * 1000000U,
+                                                      &h->interrupt_callback);
+        if (sleep_ret != AVERROR(ETIMEDOUT))
+            return sleep_ret;
+
+        reconnect_delay_total += delay;
+        reconnect_delay = 1 + 2 * reconnect_delay;
+        conn_attempts++;
+        s->retry_after = 0;
+
+        if (mvd_seek(h, target, SEEK_SET) < 0)
+            return ret;
+    }
 }
 
 static int64_t mvd_seek(URLContext *h, int64_t off, int whence)
@@ -577,6 +1088,13 @@ static int mvd_close(URLContext *h)
     av_freep(&s->ring);
     av_freep(&s->url);
     av_freep(&s->final_url);
+    av_freep(&s->http_version);
+    av_freep(&s->location_header);
+    av_freep(&s->content_encoding);
+    av_freep(&s->set_cookie_headers);
+    av_freep(&s->icy_metadata_headers);
+    av_freep(&s->icy_metadata_packet);
+    av_dict_free(&s->metadata);
     av_opt_free(s);
     return 0;
 }
@@ -638,7 +1156,11 @@ int ff_http_averror(int status_code, int default_averror)
 const char* ff_http_get_new_location(URLContext *h)
 {
     MVDCurlHTTPContext *s = h->priv_data;
-    return s->final_url ? s->final_url : s->url;
+    if (s->location_header)
+        return s->location_header;
+    if (s->final_url)
+        return s->final_url;
+    return s->url;
 }
 
 void ff_http_init_auth_state(URLContext *dest, const URLContext *src)
@@ -664,6 +1186,10 @@ int ff_http_do_new_request2(URLContext *h, const char *uri, AVDictionary **optio
     av_freep(&s->url);
     s->url = av_strdup(uri);
     if (!s->url) return AVERROR(ENOMEM);
+
+    // Match original http.c behavior for a new request: start from offset 0
+    s->off = 0;
+    s->request_start = 0;
 
     return mvd_start(s);
 }
