@@ -65,6 +65,7 @@
 #define HTTP_MUTLI    2
 #define MAX_DATE_LEN  19
 #define WHITESPACES " \n\t\r"
+#define LOG_ENOMEM(h, where) av_log((h), AV_LOG_ERROR, "ENOMEM in %s\n", (where))
 typedef enum {
     LOWER_PROTO,
     READ_HEADERS,
@@ -533,66 +534,35 @@ static const char *mvd_find_header_value(const char *headers, const char *key)
 
 static void mvd_log_request_headers(URLContext *h, MVDCurlHTTPContext *s, const char *range)
 {
-    if (!h || !s)
-        return;
+    AVBPrint bp;
+    av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
 
-    av_log(h, AV_LOG_DEBUG, "HTTP %s request to %s\n",
-           (h->flags & AVIO_FLAG_WRITE) ? "WRITE" : "READ",
-           s->url ? s->url : "");
-
-    // Prefer explicit -headers values for display.
-    const char *ua = mvd_find_header_value(s->headers, "User-Agent");
-    const char *ref = mvd_find_header_value(s->headers, "Referer");
-
-    if (ua) {
-        const char *ua_end = strchr(ua, '\n');
-        size_t ua_len = ua_end ? (size_t)(ua_end - ua) : strlen(ua);
-        while (ua_len && ua[ua_len - 1] == '\r')
-            ua_len--;
-        av_log(h, AV_LOG_DEBUG, "  User-Agent: %.*s\n", (int)ua_len, ua);
-    } else if (s->user_agent && *s->user_agent) {
-        av_log(h, AV_LOG_DEBUG, "  User-Agent: %s\n", s->user_agent);
-    }
-
-    if (ref) {
-        const char *ref_end = strchr(ref, '\n');
-        size_t ref_len = ref_end ? (size_t)(ref_end - ref) : strlen(ref);
-        while (ref_len && ref[ref_len - 1] == '\r')
-            ref_len--;
-        av_log(h, AV_LOG_DEBUG, "  Referer: %.*s\n", (int)ref_len, ref);
-    } else if (s->referer && *s->referer) {
-        av_log(h, AV_LOG_DEBUG, "  Referer: %s\n", s->referer);
-    }
+    av_bprintf(&bp, "HTTP %s request to %s\n",
+               (h->flags & AVIO_FLAG_WRITE) ? "WRITE" : "READ",
+               s->url ? s->url : "");
 
     if (range && *range)
-        av_log(h, AV_LOG_DEBUG, "  Range: %s\n", range);
+        av_bprintf(&bp, "  Range: %s\n", range);
 
-    // Print the actual outgoing header list (one line per log call).
     if (s->hdr_list) {
         int cookie_printed = 0;
-        struct curl_slist *it = s->hdr_list;
-        for (; it; it = it->next) {
+        for (struct curl_slist *it = s->hdr_list; it; it = it->next) {
             const char *line = it->data;
-            if (!line || !*line)
+            if (!line || strchr(line, '\n') || strchr(line, '\r'))
                 continue;
-
             if (!av_strncasecmp(line, "Cookie:", 7)) {
                 if (!cookie_printed) {
-                    av_log(h, AV_LOG_DEBUG, "  Cookie: [redacted]\n");
+                    av_bprintf(&bp, "  Cookie: [redacted]\n");
                     cookie_printed = 1;
                 }
                 continue;
             }
-
-            // Ensure we never pass embedded newlines into av_log.
-            if (strchr(line, '\n') || strchr(line, '\r')) {
-                av_log(h, AV_LOG_DEBUG, "  [header contains newline; skipped]\n");
-                continue;
-            }
-
-            av_log(h, AV_LOG_DEBUG, "  %s\n", line);
+            av_bprintf(&bp, "  %s\n", line);
         }
     }
+
+    av_log(h, AV_LOG_DEBUG, "%s", bp.str);
+    av_bprint_finalize(&bp, NULL);
 }
 
 static int mvd_has_header(const char *headers, const char *needle)
@@ -602,17 +572,25 @@ static int mvd_has_header(const char *headers, const char *needle)
     return av_stristr(headers, needle) != NULL;
 }
 
-static int mvd_append_line(char **dst, const char *line)
+static int mvd_append_line(MVDCurlHTTPContext *s, char **dst, const char *line)
 {
     if (!line || !*line)
         return 0;
 
-    if (!*dst)
-        return (*dst = av_strdup(line)) ? 0 : AVERROR(ENOMEM);
+    if (!*dst) {
+        *dst = av_strdup(line);
+        if (!*dst) {
+            LOG_ENOMEM(s->h, "av_strdup in mvd_append_line");
+            return AVERROR(ENOMEM);
+        }
+        return 0;
+    }
 
     char *tmp = av_asprintf("%s\n%s", *dst, line);
-    if (!tmp)
+    if (!tmp) {
+        LOG_ENOMEM(s->h, "av_asprintf in mvd_append_line");
         return AVERROR(ENOMEM);
+    }
     av_free(*dst);
     *dst = tmp;
     return 0;
@@ -678,7 +656,7 @@ static int mvd_store_icy_header(MVDCurlHTTPContext *s, const char *tag, const ch
     char *line = av_asprintf("%s: %s", tag, value ? value : "");
     if (!line)
         return AVERROR(ENOMEM);
-    ret = mvd_append_line(&s->icy_metadata_headers, line);
+    ret = mvd_append_line(s, &s->icy_metadata_headers, line);
     av_free(line);
     return ret;
 }
@@ -786,10 +764,10 @@ static void mvd_handle_header_line(MVDCurlHTTPContext *s, const char *name, cons
         av_freep(&s->content_type);
         s->content_type = av_strdup(value);
     } else if (!av_strcasecmp(name, "set-cookie")) {
-        mvd_append_line(&s->set_cookie_headers, value);
+        mvd_append_line(s, &s->set_cookie_headers, value);
         char *cookie_line = av_asprintf("Set-Cookie: %s", value);
         if (cookie_line) {
-            mvd_append_line(&s->cookie_jar, cookie_line);
+            mvd_append_line(s, &s->cookie_jar, cookie_line);
             av_free(cookie_line);
         }
     } else if (!av_strncasecmp(name, "icy-", 4)) {
@@ -916,7 +894,10 @@ static int mvd_prepare_easy(MVDCurlHTTPContext *s)
 {
     if (!s->easy) {
         s->easy = curl_easy_init();
-        if (!s->easy) return AVERROR(ENOMEM);
+        if (!s->easy) {
+            LOG_ENOMEM(s->h, "curl_easy_init");
+            return AVERROR(ENOMEM);
+        }
     } else {
         curl_easy_reset(s->easy);
     }
@@ -1050,7 +1031,10 @@ static int mvd_start(MVDCurlHTTPContext *s)
     if (prep < 0) return prep;
 
     s->multi = curl_multi_init();
-    if (!s->multi) return AVERROR(ENOMEM);
+    if (!s->multi) {
+        LOG_ENOMEM(s->h, "curl_multi_init");
+        return AVERROR(ENOMEM);
+    }
 
     curl_multi_add_handle(s->multi, s->easy);
     return 0;
@@ -1074,6 +1058,7 @@ static int mvd_open(URLContext *h, const char *uri, int flags, AVDictionary **op
 
     s->cookie_jar = av_strdup("");
     if (!s->cookie_jar) {
+        LOG_ENOMEM(h, "av_strdup(cookie_jar)");
         ret = AVERROR(ENOMEM);
         goto fail;
     }
@@ -1086,6 +1071,7 @@ static int mvd_open(URLContext *h, const char *uri, int flags, AVDictionary **op
     av_freep(&s->url);
     s->url = av_strdup(uri);
     if (!s->url) {
+        LOG_ENOMEM(h, "av_strdup(url)");
         ret = AVERROR(ENOMEM);
         goto fail;
     }
@@ -1093,6 +1079,7 @@ static int mvd_open(URLContext *h, const char *uri, int flags, AVDictionary **op
     s->cap = MVD_CURL_RING_CAP;
     s->ring = av_malloc(s->cap);
     if (!s->ring) {
+        LOG_ENOMEM(h, "av_malloc(ring)");
         ret = AVERROR(ENOMEM);
         goto fail;
     }
@@ -1441,7 +1428,10 @@ int ff_http_do_new_request2(URLContext *h, const char *uri, AVDictionary **optio
 
     av_freep(&s->url);
     s->url = av_strdup(uri);
-    if (!s->url) return AVERROR(ENOMEM);
+    if (!s->url) {
+        LOG_ENOMEM(h, "av_strdup(url) in new_request");
+        return AVERROR(ENOMEM);
+    }
 
     // Match original http.c behavior for a new request: start from offset 0
     s->off = 0;
