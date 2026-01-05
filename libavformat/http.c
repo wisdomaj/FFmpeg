@@ -200,6 +200,7 @@ typedef struct MVDCurlHTTPContext {
     int reconnect_delay_total_max;
     int respect_retry_after;
     char *reconnect_on_http_error;
+    unsigned int retry_after;
 
     uint8_t *ring;
     size_t cap, rpos, wpos, fill;
@@ -341,7 +342,6 @@ static void mvd_update_metadata(MVDCurlHTTPContext *s, char *data)
     char *val;
     char *end;
     char *next = data;
-    URLContext *h = s->h;
 
     while (*next) {
         key = next;
@@ -357,7 +357,7 @@ static void mvd_update_metadata(MVDCurlHTTPContext *s, char *data)
         val += 2;
 
         av_dict_set(&s->metadata, key, val, 0);
-        av_log(h, AV_LOG_VERBOSE, "Metadata update for %s: %s\n", key, val);
+        av_log(s->h, AV_LOG_VERBOSE, "Metadata update for %s: %s\n", key, val);
 
         next = end + 2;
     }
@@ -561,7 +561,7 @@ static void mvd_parse_content_range(MVDCurlHTTPContext *s, const char *value)
     if (!endptr || *endptr != '-')
         return;
 
-    int64_t end = strtoll(endptr + 1, &endptr, 10);
+    (void)strtoll(endptr + 1, &endptr, 10);
     if (!endptr || *endptr != '/')
         return;
 
