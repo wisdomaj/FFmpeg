@@ -285,7 +285,9 @@ static const AVOption mvd_curl_http_options[] = {
     { "rw_timeout", "read/write timeout in microseconds", MVD_OFFSET(rw_timeout_us), AV_OPT_TYPE_INT, { .i64 = 0 },  0, INT_MAX, D },
     { "http_version", "export HTTP version",              MVD_OFFSET(http_version), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
     { "location",     "Location header value",            MVD_OFFSET(location_header), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
-    { "icy",         "request ICY metadata",              MVD_OFFSET(icy), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, D },
+    // Default to off for libcurl backend: a bunch of CDNs will hard-drop (e.g. nginx 444)
+    // requests that contain Icy-MetaData on non-ICY endpoints. Users can still enable it.
+    { "icy",         "request ICY metadata",              MVD_OFFSET(icy), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
     { "icy_metadata_headers", "return ICY metadata headers",   MVD_OFFSET(icy_metadata_headers), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT },
     { "icy_metadata_packet",  "return current ICY metadata packet", MVD_OFFSET(icy_metadata_packet), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT },
     { "metadata",     "metadata read from the bitstream", MVD_OFFSET(metadata), AV_OPT_TYPE_DICT, {0}, 0, 0, AV_OPT_FLAG_EXPORT },
@@ -479,6 +481,49 @@ static int mvd_build_headers(MVDCurlHTTPContext *s)
         p = e + 2;
     }
     return 0;
+}
+
+static void mvd_log_request_headers(URLContext *h, MVDCurlHTTPContext *s, const char *range)
+{
+    // Mirror FFmpeg's debug style: dump what we are about to send.
+    if (!h)
+        return;
+
+    AVBPrint bp;
+    av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
+
+    av_bprintf(&bp, "\n--- mvd curl request ---\n");
+    av_bprintf(&bp, "URL: %s\n", s->url ? s->url : "");
+
+    // Note: libcurl will generate Host/Accept/Connection/etc. We log what we explicitly set.
+    if (s->user_agent && *s->user_agent)
+        av_bprintf(&bp, "User-Agent: %s\n", s->user_agent);
+    if (s->referer && *s->referer)
+        av_bprintf(&bp, "Referer: %s\n", s->referer);
+
+    if (range && *range)
+        av_bprintf(&bp, "Range: %s\n", range);
+
+    if (s->headers && *s->headers) {
+        av_bprintf(&bp, "Custom headers (from -headers):\n");
+        // s->headers is CRLF-separated; print as-is but ensure it ends with \n for readability.
+        av_bprintf(&bp, "%s\n", s->headers);
+    }
+
+    // Also dump the actual slist we pass to CURLOPT_HTTPHEADER (includes injected ICY).
+    if (s->hdr_list) {
+        struct curl_slist *it = s->hdr_list;
+        av_bprintf(&bp, "libcurl header list:\n");
+        for (; it; it = it->next) {
+            if (it->data)
+                av_bprintf(&bp, "%s\n", it->data);
+        }
+    }
+
+    av_bprintf(&bp, "--- end mvd curl request ---\n");
+
+    av_log(h, AV_LOG_DEBUG, "%s", bp.str);
+    av_bprint_finalize(&bp, NULL);
 }
 
 static int mvd_has_header(const char *headers, const char *needle)
@@ -872,7 +917,7 @@ static int mvd_prepare_easy(MVDCurlHTTPContext *s)
         int ret = mvd_build_headers(s);
         if (ret < 0) return ret;
 
-        // ICY support: request metadata unless user already supplied Icy-MetaData header.
+        // ICY support: ONLY when explicitly enabled, and only if user didn't already set it.
         if (s->icy && !mvd_has_header(s->headers, "Icy-MetaData"))
             s->hdr_list = curl_slist_append(s->hdr_list, "Icy-MetaData: 1");
 
@@ -886,21 +931,29 @@ static int mvd_prepare_easy(MVDCurlHTTPContext *s)
     curl_easy_setopt(s->easy, CURLOPT_NOPROGRESS, 0L);
 #endif
 
+    // Range logic with logging
+    const char *range_for_log = NULL;
+    char range_buf[128];
+    range_buf[0] = '\0';
+
     if (!(s->h->flags & AVIO_FLAG_WRITE)) {
         if (s->request_start > 0 || s->end_off > 0) {
-            char range[128];
             if (s->end_off && s->end_off > s->request_start) {
-                snprintf(range, sizeof(range), "bytes=%"PRId64"-%"PRId64, s->request_start, s->end_off - 1);
+                snprintf(range_buf, sizeof(range_buf), "bytes=%"PRId64"-%"PRId64, s->request_start, s->end_off - 1);
             } else {
-                snprintf(range, sizeof(range), "bytes=%"PRId64"-", s->request_start);
+                snprintf(range_buf, sizeof(range_buf), "bytes=%"PRId64"-", s->request_start);
             }
-            curl_easy_setopt(s->easy, CURLOPT_RANGE, range);
+            curl_easy_setopt(s->easy, CURLOPT_RANGE, range_buf);
+            range_for_log = range_buf;
         } else {
             curl_easy_setopt(s->easy, CURLOPT_RANGE, NULL);
         }
     } else {
         curl_easy_setopt(s->easy, CURLOPT_RANGE, NULL);
     }
+
+    // Dump request headers when ffmpeg runs with -loglevel debug (or more verbose).
+    mvd_log_request_headers(s->h, s, range_for_log);
 
     curl_easy_setopt(s->easy, CURLOPT_TCP_KEEPALIVE, 1L);
     return 0;
