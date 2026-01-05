@@ -605,6 +605,18 @@ const URLProtocol ff_https_protocol = {
     .default_whitelist  = "http,https,tcp,tls,crypto,httpproxy,data,file"
 };
 
+const URLProtocol ff_httpproxy_protocol = {
+    .name               = "httpproxy",
+    .url_open2          = mvd_open,
+    .url_read           = mvd_read,
+    .url_seek           = mvd_seek,
+    .url_close          = mvd_close,
+    .priv_data_size     = sizeof(MVDCurlHTTPContext),
+    .priv_data_class    = &mvd_curl_http_class,
+    .flags              = URL_PROTOCOL_FLAG_NETWORK,
+    .default_whitelist  = "http,https,tcp,tls,crypto,httpproxy,data,file"
+};
+
 int ff_http_averror(int status_code, int default_averror)
 {
     switch (status_code) {
