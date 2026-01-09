@@ -238,6 +238,13 @@ typedef struct HLSContext {
     AVIOContext *playlist_pb;
     HLSCryptoContext  crypto_ctx;
 
+    char *custom_decryption_key_str;
+    char *custom_iv_str;
+    int have_custom_key;
+    int have_custom_iv;
+    uint8_t custom_key[16];
+    uint8_t custom_iv[16];
+
     // HLS query parameter inheritance
     int inherit_query_params;
     char *root_query;
@@ -285,6 +292,33 @@ static void append_query_if_needed(HLSContext *c, char *url_buf, size_t buf_size
 
     // Append the base query
     av_strlcat(url_buf, base_query, buf_size);
+}
+
+static const char *const HLS_CUSTOM_KEY_SENTINEL = "custom_decryption_key";
+
+static int parse_hls_custom_hex(const char *value, uint8_t out[16])
+{
+    const char *hex;
+    size_t len;
+
+    if (!value || !*value)
+        return AVERROR(EINVAL);
+
+    hex = value;
+    if (!av_strncasecmp(hex, "0x", 2))
+        hex += 2;
+
+    len = strlen(hex);
+    if (len != 32)
+        return AVERROR(EINVAL);
+
+    for (size_t i = 0; i < len; i++) {
+        if (!av_isxdigit((unsigned char)hex[i]))
+            return AVERROR(EINVAL);
+    }
+
+    ff_hex_to_data(out, hex);
+    return 0;
 }
 
 static void free_playlist_list(HLSContext *c)
@@ -845,6 +879,7 @@ static int parse_playlist(HLSContext *c, const char *url,
     struct segment **prev_segments = NULL;
     int prev_n_segments = 0;
     int64_t prev_start_seq_no = -1;
+    int saw_key_tag = 0;
 
     if (is_http && !in && c->http_persistent && c->playlist_pb) {
         in = c->playlist_pb;
@@ -910,6 +945,7 @@ static int parse_playlist(HLSContext *c, const char *url,
                                &info);
             key_type = KEY_NONE;
             has_iv = 0;
+            saw_key_tag = 1;
             if (!strcmp(info.method, "AES-128"))
                 key_type = KEY_AES_128;
             if (!strcmp(info.method, "SAMPLE-AES"))
@@ -1112,6 +1148,32 @@ static int parse_playlist(HLSContext *c, const char *url,
                 seg->init_section = cur_init_section;
             }
         }
+    }
+
+    if (pls && c->have_custom_key && !saw_key_tag) {
+        for (int i = 0; i < pls->n_segments; i++) {
+            struct segment *seg = pls->segments[i];
+            seg->key_type = KEY_AES_128;
+            av_freep(&seg->key);
+            seg->key = av_strdup(HLS_CUSTOM_KEY_SENTINEL);
+            if (!seg->key) {
+                ret = AVERROR(ENOMEM);
+                goto fail;
+            }
+        }
+        for (int i = 0; i < pls->n_init_sections; i++) {
+            struct segment *init_section = pls->init_sections[i];
+            init_section->key_type = KEY_AES_128;
+            av_freep(&init_section->key);
+            init_section->key = av_strdup(HLS_CUSTOM_KEY_SENTINEL);
+            if (!init_section->key) {
+                ret = AVERROR(ENOMEM);
+                goto fail;
+            }
+        }
+        av_log(c->ctx, AV_LOG_DEBUG,
+               "Custom HLS key override applied across playlist '%s' without EXT-X-KEY\n",
+               pls->url);
     }
     if (prev_segments) {
         if (pls->start_seq_no > prev_start_seq_no && c->first_timestamp != AV_NOPTS_VALUE) {
@@ -1454,6 +1516,7 @@ static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg, 
     AVDictionary *opts = NULL;
     int ret;
     int is_http = 0;
+    int override_key = c->have_custom_key && seg->key_type == KEY_AES_128;
 
     if (c->http_persistent)
         av_dict_set(&opts, "multiple_requests", "1", 0);
@@ -1468,22 +1531,33 @@ static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg, 
     av_log(pls->parent, AV_LOG_VERBOSE, "HLS request for url '%s', offset %"PRId64", playlist %d\n",
            seg->url, seg->url_offset, pls->index);
 
-    if (seg->key_type == KEY_AES_128 || seg->key_type == KEY_SAMPLE_AES) {
-        if (strcmp(seg->key, pls->key_url)) {
-            ret = read_key(c, pls, seg);
-            if (ret < 0)
-                goto cleanup;
-        }
+    if (override_key) {
+        memcpy(pls->key, c->custom_key, sizeof(pls->key));
+        av_strlcpy(pls->key_url, HLS_CUSTOM_KEY_SENTINEL, sizeof(pls->key_url));
+        av_log(pls->parent, AV_LOG_DEBUG,
+               "Custom HLS decryption key override in effect for '%s'\n", seg->url);
+    } else if ((seg->key_type == KEY_AES_128 || seg->key_type == KEY_SAMPLE_AES) &&
+               seg->key && strcmp(seg->key, pls->key_url)) {
+        ret = read_key(c, pls, seg);
+        if (ret < 0)
+            goto cleanup;
     }
 
     if (seg->key_type == KEY_AES_128) {
         char iv[33], key[33], url[MAX_URL_SIZE];
-        ff_data_to_hex(iv, seg->iv, sizeof(seg->iv), 0);
-        ff_data_to_hex(key, pls->key, sizeof(pls->key), 0);
+        const uint8_t *key_bytes = override_key ? c->custom_key : pls->key;
+        const uint8_t *iv_bytes = c->have_custom_iv ? c->custom_iv : seg->iv;
+
+        ff_data_to_hex(iv, iv_bytes, sizeof(seg->iv), 0);
+        ff_data_to_hex(key, key_bytes, sizeof(pls->key), 0);
         if (strstr(seg->url, "://"))
             snprintf(url, sizeof(url), "crypto+%s", seg->url);
         else
             snprintf(url, sizeof(url), "crypto:%s", seg->url);
+
+        if (c->have_custom_iv)
+            av_log(pls->parent, AV_LOG_DEBUG,
+                   "Using custom HLS IV for segment '%s'\n", seg->url);
 
         av_dict_set(&opts, "key", key, 0);
         av_dict_set(&opts, "iv", iv, 0);
@@ -2216,6 +2290,8 @@ static int hls_close(AVFormatContext *s)
     av_dict_free(&c->avio_opts);
     ff_format_io_close(c->ctx, &c->playlist_pb);
     av_freep(&c->root_query);
+    av_freep(&c->custom_decryption_key_str);
+    av_freep(&c->custom_iv_str);
 
     return 0;
 }
@@ -2245,6 +2321,26 @@ static int hls_read_header(AVFormatContext *s)
 
     if ((ret = ffio_copy_url_options(s->pb, &c->avio_opts)) < 0)
         return ret;
+
+    if (c->custom_decryption_key_str && *c->custom_decryption_key_str) {
+        ret = parse_hls_custom_hex(c->custom_decryption_key_str, c->custom_key);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR, "Invalid value for custom_decryption_key\n");
+            return ret;
+        }
+        c->have_custom_key = 1;
+        av_log(s, AV_LOG_DEBUG, "Custom HLS decryption key override active\n");
+    }
+
+    if (c->custom_iv_str && *c->custom_iv_str) {
+        ret = parse_hls_custom_hex(c->custom_iv_str, c->custom_iv);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR, "Invalid value for custom_iv\n");
+            return ret;
+        }
+        c->have_custom_iv = 1;
+        av_log(s, AV_LOG_DEBUG, "Custom HLS IV override active\n");
+    }
 
     /* XXX: Some HLS servers don't like being sent the range header,
        in this case, we need to set http_seekable = 0 to disable
@@ -2946,6 +3042,12 @@ static const AVOption hls_options[] = {
     {"ignore_hier_sidx",
      "Forward hierarchical SIDX tolerance to nested demuxers (MOV). Default off.",
      OFFSET(ignore_hier_sidx), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS},
+    {"custom_decryption_key",
+     "Override AES-128 key with 32 hex chars (optional 0x prefix)",
+     OFFSET(custom_decryption_key_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS},
+    {"custom_iv",
+     "Override IV with 32 hex chars (optional 0x prefix)",
+     OFFSET(custom_iv_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS},
     {NULL}
 };
 
