@@ -48,7 +48,7 @@
 
 #include "hls_sample_encryption.h"
 
-#define INITIAL_BUFFER_SIZE 32768
+#define INITIAL_BUFFER_SIZE (512 * 1024)
 
 #define MAX_FIELD_LEN 64
 #define MAX_CHARACTERISTICS_LEN 512
