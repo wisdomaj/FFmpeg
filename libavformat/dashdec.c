@@ -781,14 +781,23 @@ static int resolve_content_path(AVFormatContext *s, const char *url, int *max_ur
     }
     root_url = (av_strcasecmp(baseurl, "")) ? baseurl : path;
     if (node) {
-        xmlNodeSetContent(node, root_url);
+        xmlChar *escaped_root = xmlEncodeSpecialChars(NULL, root_url);
+        if (!escaped_root) {
+            updated = AVERROR(ENOMEM);
+            goto end;
+        }
+        xmlNodeSetContent(node, escaped_root);
+        xmlFree(escaped_root);
         updated = 1;
     }
 
     size = strlen(root_url);
     isRootHttp = ishttp(root_url);
 
-    if (size > 0 && root_url[size - 1] != token) {
+    /* If root_url is a full signed URL (common on CDNs like fbcdn) it may contain
+     * a query string. Appending '/' corrupts the URL and may invalidate signatures.
+     */
+    if (size > 0 && root_url[size - 1] != token && !strchr(root_url, '?')) {
         av_strlcat(root_url, "/", size + 2);
         size += 2;
     }
