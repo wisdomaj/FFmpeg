@@ -174,6 +174,19 @@ static int aligned(int val)
     return ((val + 0x3F) >> 6) << 6;
 }
 
+static void normalize_url_backslashes(char *url)
+{
+    char *p;
+
+    if (!url)
+        return;
+
+    for (p = url; *p; p++) {
+        if (*p == '\\')
+            *p = '/';
+    }
+}
+
 static uint64_t get_current_time_in_sec(void)
 {
     return  av_gettime() / 1000000;
@@ -1722,6 +1735,7 @@ static int open_input(DASHContext *c, struct representation *pls, struct fragmen
     }
 
     ff_make_absolute_url(url, c->max_url_size, c->base_url, seg->url);
+    normalize_url_backslashes(url);
     av_log(pls->parent, AV_LOG_VERBOSE, "DASH request for url '%s', offset %"PRId64"\n",
            url, seg->url_offset);
     ret = open_url(pls->parent, &pls->input, url, &c->avio_opts, opts, NULL);
