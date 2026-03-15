@@ -1235,32 +1235,40 @@ static int strip_png_wrapper(uint8_t *buf, int buf_size)
         0x0D, 0x0A, 0x1A, 0x0A
     };
 
-    /* IEND chunk header: 00 00 00 0 | 'I' 'E' 'N' 'D' */
+    /* IEND chunk header: 00 00 00 00 'I' 'E' 'N' 'D' */
     static const uint8_t iend_marker[8] = {
         0x00, 0x00, 0x00, 0x00,
         0x49, 0x45, 0x4E, 0x44
     };
 
-    if (buf_size < 8 || memcmp(buf, png_magic, 8) != 0)
-        return 0; /* Not PNG */
+    int offset = 0;
 
-    /* Search for IEND chunk header starting after signature */
-    for (int i = 8; i + 8 <= buf_size; i++) {
-        if (!memcmp(buf + i, iend_marker, 8)) {
-            int end_of_png = i + 8 + 4; /* header(8) + CRC(4) */
+    /* Loop to strip multiple PNG wrappers chained at the beginning */
+    while (buf_size - offset >= 8 && memcmp(buf + offset, png_magic, 8) == 0) {
+        int found = 0;
 
-            /* Sanity: we must have the CRC inside this buffer */
-            if (end_of_png <= buf_size)
-                return end_of_png;
+        /* Search for IEND chunk inside the remaining buffer */
+        for (int i = offset + 8; i + 8 <= buf_size; i++) {
+            if (!memcmp(buf + i, iend_marker, 8)) {
+                int end_of_png = i + 8 + 4; /* header + CRC */
 
-            /* IEND header found but CRC not in this buffer:
-               treat as incomplete → don't strip. */
-            return 0;
+                if (end_of_png <= buf_size) {
+                    offset = end_of_png;
+                    found = 1;
+                    break;
+                }
+
+                /* Incomplete PNG in this buffer – abort stripping */
+                return offset;
+            }
         }
+
+        /* No complete PNG found, stop stripping */
+        if (!found)
+            break;
     }
 
-    /* No IEND inside this buffer */
-    return 0;
+    return offset;
 }
 
 static int read_from_url(struct playlist *pls, struct segment *seg,
