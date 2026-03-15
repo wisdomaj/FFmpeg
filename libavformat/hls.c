@@ -1889,7 +1889,7 @@ restart:
             av_log(v->parent, AV_LOG_DEBUG, "PNG check: cur_seg_offset=%"PRId64", ret=%d, condition=%d\n",
                    v->cur_seg_offset, ret, v->cur_seg_offset == ret);
         }
-        if (c->skip_png_bytes && v->cur_seg_offset == ret) {
+        if (c->skip_png_bytes && (v->cur_seg_offset - ret == 0) && ret >= 8 && buf[0] == 0x89) {
             /* Strip PNG wrapper if present at the start of the segment */
             int skip = strip_png_wrapper(buf, ret);
             if (skip > 0 && skip < ret) {
